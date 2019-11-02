@@ -15,7 +15,7 @@
 #include "_reg_localTransformation_gpu.h"
 #include "_reg_localTransformation_kernels.cu"
 
-/* *************************************************************** */
+
 /* *************************************************************** */
 void reg_bspline_gpu(nifti_image *controlPointImage,
                      nifti_image *reference,
@@ -25,36 +25,153 @@ void reg_bspline_gpu(nifti_image *controlPointImage,
                      int activeVoxelNumber,
                      bool bspline)
 {
+
+#define IDR 2 //findtoo, valid values = 1,2: 1 original, 2 accelerated - check also reg_apps/reg_f3d.cpp if necessary
+
+#if IDR == 1
+    const int useBSpline = bspline;
+#endif
+
     const int voxelNumber = reference->nx * reference->ny * reference->nz;
-    const int controlPointNumber = controlPointImage->nx*controlPointImage->ny*controlPointImage->nz;
     const int3 referenceImageDim = make_int3(reference->nx, reference->ny, reference->nz);
     const int3 controlPointImageDim = make_int3(controlPointImage->nx, controlPointImage->ny, controlPointImage->nz);
-    const int useBSpline = bspline;
+
+    const int controlPointNumber = controlPointImage->nx*controlPointImage->ny*controlPointImage->nz;
 
     const float3 controlPointVoxelSpacing = make_float3(
         controlPointImage->dx / reference->dx,
         controlPointImage->dy / reference->dy,
         controlPointImage->dz / reference->dz);
 
-    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_UseBSpline,&useBSpline,sizeof(int)))
+#if IDR == 2
+    const int3 controlPointVoxelSpacingInt = make_int3(
+        lrintf( controlPointImage->dx / reference->dx ),
+        lrintf( controlPointImage->dy / reference->dy ),
+        lrintf( controlPointImage->dz / reference->dz ));
+#endif
+
+#if IDR == 1
+    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_UseBSpline,&useBSpline,sizeof(int)))//
+    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_ControlPointVoxelSpacing,&controlPointVoxelSpacing,sizeof(float3)))//
+    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_ActiveVoxelNumber,&activeVoxelNumber,sizeof(int)))//
+#endif
+    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_ControlPointImageDim,&controlPointImageDim,sizeof(int3)))//
+    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_ReferenceImageDim,&referenceImageDim,sizeof(int3)))//
     NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_VoxelNumber,&voxelNumber,sizeof(int)))
-    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_ReferenceImageDim,&referenceImageDim,sizeof(int3)))
-    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_ControlPointImageDim,&controlPointImageDim,sizeof(int3)))
-    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_ControlPointVoxelSpacing,&controlPointVoxelSpacing,sizeof(float3)))
-    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_ActiveVoxelNumber,&activeVoxelNumber,sizeof(int)))
+
+#if IDR == 2
+    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_controlPointVoxelSpacingInt,&controlPointVoxelSpacingInt,sizeof(float3)))
+#endif
 
     NR_CUDA_SAFE_CALL(cudaBindTexture(0, controlPointTexture, *controlPointImageArray_d, controlPointNumber*sizeof(float4)))
-    NR_CUDA_SAFE_CALL(cudaBindTexture(0, maskTexture, *mask_d, activeVoxelNumber*sizeof(int)))
 
-    const unsigned int Grid_reg_bspline_getDeformationField =
+#if IDR == 2
+    const int3 tilesDim = make_int3(ceilf((float)reference->nx / (float)controlPointVoxelSpacing.x),
+                                    ceilf((float)reference->ny / (float)controlPointVoxelSpacing.y),
+                                    ceilf((float)reference->nz / (float)controlPointVoxelSpacing.z));
+    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_tilesDim,&tilesDim,sizeof(int3)))
+
+    float x_g0[MAX_CURRENT_SPACE];
+    float y_g0[MAX_CURRENT_SPACE];
+    float z_g0[MAX_CURRENT_SPACE];
+    float x_h0_r[MAX_CURRENT_SPACE];
+    float x_h1_r[MAX_CURRENT_SPACE];
+    float y_h0_r[MAX_CURRENT_SPACE];
+    float y_h1_r[MAX_CURRENT_SPACE];
+    float z_h0_r[MAX_CURRENT_SPACE];
+    float z_h1_r[MAX_CURRENT_SPACE];
+    float xBasis[NUM_C*MAX_CURRENT_SPACE];
+    float yBasis[NUM_C*MAX_CURRENT_SPACE];
+    float zBasis[NUM_C*MAX_CURRENT_SPACE];
+    float relative;
+    for (int i = 0; i < controlPointVoxelSpacingInt.x; ++i) {
+        relative = (float) i / controlPointVoxelSpacing.x;
+        float FF= relative*relative;
+        float FFF= FF*relative;
+        float MF=1.f-relative;
+        xBasis[0+NUM_C*i] = (MF)*(MF)*(MF)/(6.f);
+        xBasis[1+NUM_C*i] = (3.f*FFF - 6.f*FF + 4.f)/6.f;
+        xBasis[2+NUM_C*i] = (-3.f*FFF + 3.f*FF + 3.f*relative + 1.f)/6.f;
+        xBasis[3+NUM_C*i] = (FFF/6.f);
+
+        x_g0[i] = xBasis[0+NUM_C*i] + xBasis[1+NUM_C*i];
+
+        x_h0_r[i] = xBasis[1+NUM_C*i] / (x_g0[i]);
+        x_h1_r[i] = xBasis[3+NUM_C*i] / (1 - x_g0[i]);
+
+    }
+    for (int i = 0; i < controlPointVoxelSpacingInt.y; ++i) {
+        relative = (float) i / controlPointVoxelSpacing.y;
+        float FF= relative*relative;
+        float FFF= FF*relative;
+        float MF=1.f-relative;
+        yBasis[0+NUM_C*i] = (MF)*(MF)*(MF)/(6.f);
+        yBasis[1+NUM_C*i] = (3.f*FFF - 6.f*FF + 4.f)/6.f;
+        yBasis[2+NUM_C*i] = (-3.f*FFF + 3.f*FF + 3.f*relative + 1.f)/6.f;
+        yBasis[3+NUM_C*i] = (FFF/6.f);
+
+        y_g0[i] = yBasis[0+NUM_C*i] + yBasis[1+NUM_C*i];
+
+        y_h0_r[i] = yBasis[1+NUM_C*i] / (y_g0[i]);
+        y_h1_r[i] = yBasis[3+NUM_C*i] / (1 - y_g0[i]);
+    }
+    for (int i = 0; i < controlPointVoxelSpacingInt.z; ++i) {
+        relative = (float) i / controlPointVoxelSpacing.z;
+        float FF= relative*relative;
+        float FFF= FF*relative;
+        float MF=1.f-relative;
+        zBasis[0+NUM_C*i] = (MF)*(MF)*(MF)/(6.f);
+        zBasis[1+NUM_C*i] = (3.f*FFF - 6.f*FF + 4.f)/6.f;
+        zBasis[2+NUM_C*i] = (-3.f*FFF + 3.f*FF + 3.f*relative + 1.f)/6.f;
+        zBasis[3+NUM_C*i] = (FFF/6.f);
+
+        z_g0[i] = zBasis[0+NUM_C*i] + zBasis[1+NUM_C*i];
+
+        z_h0_r[i] = zBasis[1+NUM_C*i] / (z_g0[i]);
+        z_h1_r[i] = zBasis[3+NUM_C*i] / (1 - z_g0[i]);
+    }
+
+    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_x_g0,&x_g0,MAX_CURRENT_SPACE*sizeof(float)))
+    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_y_g0,&y_g0,MAX_CURRENT_SPACE*sizeof(float)))
+    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_z_g0,&z_g0,MAX_CURRENT_SPACE*sizeof(float)))
+
+    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_x_h0_r,&x_h0_r,MAX_CURRENT_SPACE*sizeof(float)))
+    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_x_h1_r,&x_h1_r,MAX_CURRENT_SPACE*sizeof(float)))
+    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_y_h0_r,&y_h0_r,MAX_CURRENT_SPACE*sizeof(float)))
+    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_y_h1_r,&y_h1_r,MAX_CURRENT_SPACE*sizeof(float)))
+    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_z_h0_r,&z_h0_r,MAX_CURRENT_SPACE*sizeof(float)))
+    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_z_h1_r,&z_h1_r,MAX_CURRENT_SPACE*sizeof(float)))
+
+    dim3 B2(BLOCK_BS_X,BLOCK_BS_Y,BLOCK_BS_Z);
+    dim3 G2((unsigned int) ceilf((float)(tilesDim.x) / B2.x),
+            (unsigned int) ceilf((float)(tilesDim.y) / B2.y),
+            (unsigned int) ceilf((float)(tilesDim.z) / B2.z));
+#endif
+
+#if IDR == 1
+    const unsigned int Grid_reg_bspline_getDeformationField0 =
         (unsigned int)ceilf(sqrtf((float)activeVoxelNumber/(float)(Block_reg_bspline_getDeformationField)));
-    dim3 G1(Grid_reg_bspline_getDeformationField,Grid_reg_bspline_getDeformationField,1);
-    dim3 B1(Block_reg_bspline_getDeformationField,1,1);
-    reg_bspline_getDeformationField <<< G1, B1 >>>(*positionFieldImageArray_d);
-    NR_CUDA_CHECK_KERNEL(G1,B1)
+    dim3 G0(Grid_reg_bspline_getDeformationField0,Grid_reg_bspline_getDeformationField0,1);
+    dim3 B0(256,1,1);
+#endif
+
+#if IDR == 1
+    reg_bspline_getDeformationField0<<< G0, B0 >>>(*positionFieldImageArray_d);
+#endif
+#if IDR == 2
+    reg_bspline_getDeformationField<<<G2, B2 >>>(*positionFieldImageArray_d, *controlPointImageArray_d);
+#endif
+
+    cudaThreadSynchronize();
+    cudaError err = cudaPeekAtLastError();
+    if( err != cudaSuccess) {
+        fprintf(stderr, "[NiftyReg CUDA ERROR] file _reg_localTransformation_gpu.cu : %s.\n",
+        cudaGetErrorString(err));
+        exit(1);
+    }
 
     NR_CUDA_SAFE_CALL(cudaUnbindTexture(controlPointTexture))
-    NR_CUDA_SAFE_CALL(cudaUnbindTexture(maskTexture))
+
     return;
 }
 /* *************************************************************** */

@@ -23,14 +23,27 @@
         };
 #endif
 
-#if __CUDA_ARCH__ >= 120
-    #if __CUDA_ARCH__ >= 200
+//#if __CUDA_ARCH__ >= 120
+//    #if __CUDA_ARCH__ >= 200
 /* ************************************************************************ */
 #define Block_reg_affine_deformationField 512                       // 20 regs
 #define Block_result_block 416                                      // 26 regs - 11016+00
 #define Block_target_block 512                                      // 18 regs
 /* ************************************************************************ */
-#define Block_reg_bspline_getDeformationField 352                   // 44 regs - 11264+00
+#define Block_reg_bspline_getDeformationField 256 //352                   // 44 regs - 11264+00
+#define BLOCK_BS_X 4
+#define BLOCK_BS_Y 4
+#define BLOCK_BS_Z 4
+#define BLOCK_SIZE 64  // BLOCK_BS_X*BLOCK_BS_Y*BLOCK_BS_Z
+#define NUM_C 4                                 //Number of control points that affect a voxel in the 3 axes
+//Distance in pixels for control points ! it may be different in different dimensions !!! The spacing could be different
+// -> from the input arguments to the program if the input has to be downsampled (if one of the (dimension/2 < 32) )
+// -> - see reg_createImagePyramid TODO remove
+#define CURRENT_SPACE 5
+//Mainly helps to allocate constant memory. Should be double the desired maximum in case there is downsampling of the
+// -> input (if one of the (dimension/2 < 32) ) - see reg_createImagePyramid
+#define MAX_CURRENT_SPACE 32
+
 #define Block_reg_bspline_getApproxSecondDerivatives 352            // 43 regs - 00648+00
 #define Block_reg_bspline_getApproxBendingEnergy 384                // 27 regs
 #define Block_reg_bspline_getApproxBendingEnergyGradient 512        // 31 regs
@@ -69,98 +82,98 @@
 #define Block_reg_ApplyConvolutionWindowAlongY 512                  // 15 regs
 #define Block_reg_ApplyConvolutionWindowAlongZ 512                  // 16 regs
 /* ************************************************************************ */
-    #else // __CUDA_ARCH__ >= 200
-/* ************************************************************************ */
-#define Block_reg_affine_deformationField 512                       // 16 regs
-#define Block_result_block 384                                      // 21 regs - 11032+16
-#define Block_target_block 512                                      // 15 regs
-/* ************************************************************************ */
-#define Block_reg_bspline_getDeformationField 384                   // 37 regs - 12296+16
-#define Block_reg_bspline_getApproxSecondDerivatives 448            // 35 regs - 00656+16
-#define Block_reg_bspline_getApproxBendingEnergy 512                // 12 regs
-#define Block_reg_bspline_getApproxBendingEnergyGradient 320        // 23 regs
-#define Block_reg_bspline_getApproxJacobianValues 512               // 27 regs
-#define Block_reg_bspline_getJacobianValues 384                     // 41 regs - 12304+16
-#define Block_reg_bspline_logSquaredValues 512                      // 07 regs
-#define Block_reg_bspline_computeApproxJacGradient 512              // 32 regs
-#define Block_reg_bspline_computeJacGradient 512                    // 32 regs
-#define Block_reg_bspline_approxCorrectFolding 512                  // 32 regs
-#define Block_reg_bspline_correctFolding 512                        // 31 regs
-#define Block_reg_defField_compose 448                              // 18 regs
-#define Block_reg_defField_getJacobianMatrix 512                    // ?? regs
-/* ************************************************************************ */
-#define Block_reg_getVoxelBasedNMIGradientUsingPW 320               // 25 regs
-#define Block_reg_getVoxelBasedNMIGradientUsingPW2x2 384            // 42 regs
-#define Block_reg_smoothJointHistogramX 512                         // 07 regs
-#define Block_reg_smoothJointHistogramY 512                         // 11 regs
-#define Block_reg_smoothJointHistogramZ 512                         // 11 regs
-#define Block_reg_smoothJointHistogramW 512                         // 08 regs
-#define Block_reg_marginaliseTargetX 512                            // 06 regs
-#define Block_reg_marginaliseTargetXY 512                           // 06 regs
-#define Block_reg_marginaliseResultX 512                            // 07 regs
-#define Block_reg_marginaliseResultXY 512                           // 07 regs
-/* ************************************************************************ */
-#define Block_reg_getSourceImageGradient 320                        // 25 regs
-#define Block_reg_resampleSourceImage 512                           // 16 regs
-/* ************************************************************************ */
-#define Block_reg_voxelCentric2NodeCentric 512                      // 11 regs
-#define Block_reg_convertNMIGradientFromVoxelToRealSpace 512        // 16 regs
-#define Block_reg_initialiseConjugateGradient 512                   // 09 regs
-#define Block_reg_GetConjugateGradient1 512                         // 12 regs
-#define Block_reg_GetConjugateGradient2 512                         // 10 regs
-#define Block_reg_getMaximalLength 384                              // 07 regs
-#define Block_reg_updateControlPointPosition 512                    // 08 regs
-#define Block_reg_ApplyConvolutionWindowAlongX 512                  // 14 regs
-#define Block_reg_ApplyConvolutionWindowAlongY 512                  // 14 regs
-#define Block_reg_ApplyConvolutionWindowAlongZ 512                  // 15 regs
-/* ************************************************************************ */
-    #endif // __CUDA_ARCH__ >= 200
-#else // __CUDA_ARCH__ >= 120
-/* ************************************************************************ */
-#define Block_reg_affine_deformationField 512                       // 16 regs
-#define Block_result_block 384                                      // 21 regs - 11032+16
-#define Block_target_block 512                                      // 15 regs
-/* ************************************************************************ */
-#define Block_reg_bspline_getDeformationField 192                   // 37 regs - 06152+16
-#define Block_reg_bspline_getApproxSecondDerivatives 192            // 35 regs - 00656+16
-#define Block_reg_bspline_getApproxBendingEnergy 320                // 12 regs
-#define Block_reg_bspline_getApproxBendingEnergyGradient 256        // 27 regs
-#define Block_reg_bspline_getApproxJacobianValues 256               // 27 regs
-#define Block_reg_bspline_getJacobianValues 192                     // 41 regs - 09280+16
-#define Block_reg_bspline_logSquaredValues 384                      // 07 regs
-#define Block_reg_bspline_computeApproxJacGradient 256              // 32 regs
-#define Block_reg_bspline_computeJacGradient 256                    // 32 regs
-#define Block_reg_bspline_approxCorrectFolding 256                  // 32 regs
-#define Block_reg_bspline_correctFolding 256                        // 31 regs
-#define Block_reg_defField_compose 448                              // 18 regs
-#define Block_reg_defField_getJacobianMatrix 512                    // 16 regs
-/* ************************************************************************ */
-#define Block_reg_getVoxelBasedNMIGradientUsingPW 320               // 25 regs
-#define Block_reg_getVoxelBasedNMIGradientUsingPW2x2 192            // 42 regs
-#define Block_reg_smoothJointHistogramX 512                         // 07 regs
-#define Block_reg_smoothJointHistogramY 512                         // 11 regs
-#define Block_reg_smoothJointHistogramZ 512                         // 11 regs
-#define Block_reg_smoothJointHistogramW 512                         // 08 regs
-#define Block_reg_marginaliseTargetX 512                            // 06 regs
-#define Block_reg_marginaliseTargetXY 512                           // 06 regs
-#define Block_reg_marginaliseResultX 512                            // 07 regs
-#define Block_reg_marginaliseResultXY 512                           // 07 regs
-/* ************************************************************************ */
-#define Block_reg_getSourceImageGradient 320                        // 25 regs
-#define Block_reg_resampleSourceImage 512                           // 16 regs
-/* ************************************************************************ */
-#define Block_reg_voxelCentric2NodeCentric 512                      // 11 regs
-#define Block_reg_convertNMIGradientFromVoxelToRealSpace 512        // 16 regs
-#define Block_reg_initialiseConjugateGradient 512                   // 09 regs
-#define Block_reg_GetConjugateGradient1 512                         // 12 regs
-#define Block_reg_GetConjugateGradient2 512                         // 10 regs
-#define Block_reg_getMaximalLength 384                              // 07 regs
-#define Block_reg_updateControlPointPosition 512                    // 08 regs
-#define Block_reg_ApplyConvolutionWindowAlongX 512                  // 14 regs
-#define Block_reg_ApplyConvolutionWindowAlongY 512                  // 14 regs
-#define Block_reg_ApplyConvolutionWindowAlongZ 512                  // 15 regs
-/* ************************************************************************ */
-#endif // __CUDA_ARCH__ >= 200
+//    #else // __CUDA_ARCH__ >= 200
+///* ************************************************************************ */
+//#define Block_reg_affine_deformationField 512                       // 16 regs
+//#define Block_result_block 384                                      // 21 regs - 11032+16
+//#define Block_target_block 512                                      // 15 regs
+///* ************************************************************************ */
+//#define Block_reg_bspline_getDeformationField 384                   // 37 regs - 12296+16
+//#define Block_reg_bspline_getApproxSecondDerivatives 448            // 35 regs - 00656+16
+//#define Block_reg_bspline_getApproxBendingEnergy 512                // 12 regs
+//#define Block_reg_bspline_getApproxBendingEnergyGradient 320        // 23 regs
+//#define Block_reg_bspline_getApproxJacobianValues 512               // 27 regs
+//#define Block_reg_bspline_getJacobianValues 384                     // 41 regs - 12304+16
+//#define Block_reg_bspline_logSquaredValues 512                      // 07 regs
+//#define Block_reg_bspline_computeApproxJacGradient 512              // 32 regs
+//#define Block_reg_bspline_computeJacGradient 512                    // 32 regs
+//#define Block_reg_bspline_approxCorrectFolding 512                  // 32 regs
+//#define Block_reg_bspline_correctFolding 512                        // 31 regs
+//#define Block_reg_defField_compose 448                              // 18 regs
+//#define Block_reg_defField_getJacobianMatrix 512                    // ?? regs
+///* ************************************************************************ */
+//#define Block_reg_getVoxelBasedNMIGradientUsingPW 320               // 25 regs
+//#define Block_reg_getVoxelBasedNMIGradientUsingPW2x2 384            // 42 regs
+//#define Block_reg_smoothJointHistogramX 512                         // 07 regs
+//#define Block_reg_smoothJointHistogramY 512                         // 11 regs
+//#define Block_reg_smoothJointHistogramZ 512                         // 11 regs
+//#define Block_reg_smoothJointHistogramW 512                         // 08 regs
+//#define Block_reg_marginaliseTargetX 512                            // 06 regs
+//#define Block_reg_marginaliseTargetXY 512                           // 06 regs
+//#define Block_reg_marginaliseResultX 512                            // 07 regs
+//#define Block_reg_marginaliseResultXY 512                           // 07 regs
+///* ************************************************************************ */
+//#define Block_reg_getSourceImageGradient 320                        // 25 regs
+//#define Block_reg_resampleSourceImage 512                           // 16 regs
+///* ************************************************************************ */
+//#define Block_reg_voxelCentric2NodeCentric 512                      // 11 regs
+//#define Block_reg_convertNMIGradientFromVoxelToRealSpace 512        // 16 regs
+//#define Block_reg_initialiseConjugateGradient 512                   // 09 regs
+//#define Block_reg_GetConjugateGradient1 512                         // 12 regs
+//#define Block_reg_GetConjugateGradient2 512                         // 10 regs
+//#define Block_reg_getMaximalLength 384                              // 07 regs
+//#define Block_reg_updateControlPointPosition 512                    // 08 regs
+//#define Block_reg_ApplyConvolutionWindowAlongX 512                  // 14 regs
+//#define Block_reg_ApplyConvolutionWindowAlongY 512                  // 14 regs
+//#define Block_reg_ApplyConvolutionWindowAlongZ 512                  // 15 regs
+///* ************************************************************************ */
+//    #endif // __CUDA_ARCH__ >= 200
+//#else // __CUDA_ARCH__ >= 120
+///* ************************************************************************ */
+//#define Block_reg_affine_deformationField 512                       // 16 regs
+//#define Block_result_block 384                                      // 21 regs - 11032+16
+//#define Block_target_block 512                                      // 15 regs
+///* ************************************************************************ */
+//#define Block_reg_bspline_getDeformationField 192                   // 37 regs - 06152+16
+//#define Block_reg_bspline_getApproxSecondDerivatives 192            // 35 regs - 00656+16
+//#define Block_reg_bspline_getApproxBendingEnergy 320                // 12 regs
+//#define Block_reg_bspline_getApproxBendingEnergyGradient 256        // 27 regs
+//#define Block_reg_bspline_getApproxJacobianValues 256               // 27 regs
+//#define Block_reg_bspline_getJacobianValues 192                     // 41 regs - 09280+16
+//#define Block_reg_bspline_logSquaredValues 384                      // 07 regs
+//#define Block_reg_bspline_computeApproxJacGradient 256              // 32 regs
+//#define Block_reg_bspline_computeJacGradient 256                    // 32 regs
+//#define Block_reg_bspline_approxCorrectFolding 256                  // 32 regs
+//#define Block_reg_bspline_correctFolding 256                        // 31 regs
+//#define Block_reg_defField_compose 448                              // 18 regs
+//#define Block_reg_defField_getJacobianMatrix 512                    // 16 regs
+///* ************************************************************************ */
+//#define Block_reg_getVoxelBasedNMIGradientUsingPW 320               // 25 regs
+//#define Block_reg_getVoxelBasedNMIGradientUsingPW2x2 192            // 42 regs
+//#define Block_reg_smoothJointHistogramX 512                         // 07 regs
+//#define Block_reg_smoothJointHistogramY 512                         // 11 regs
+//#define Block_reg_smoothJointHistogramZ 512                         // 11 regs
+//#define Block_reg_smoothJointHistogramW 512                         // 08 regs
+//#define Block_reg_marginaliseTargetX 512                            // 06 regs
+//#define Block_reg_marginaliseTargetXY 512                           // 06 regs
+//#define Block_reg_marginaliseResultX 512                            // 07 regs
+//#define Block_reg_marginaliseResultXY 512                           // 07 regs
+///* ************************************************************************ */
+//#define Block_reg_getSourceImageGradient 320                        // 25 regs
+//#define Block_reg_resampleSourceImage 512                           // 16 regs
+///* ************************************************************************ */
+//#define Block_reg_voxelCentric2NodeCentric 512                      // 11 regs
+//#define Block_reg_convertNMIGradientFromVoxelToRealSpace 512        // 16 regs
+//#define Block_reg_initialiseConjugateGradient 512                   // 09 regs
+//#define Block_reg_GetConjugateGradient1 512                         // 12 regs
+//#define Block_reg_GetConjugateGradient2 512                         // 10 regs
+//#define Block_reg_getMaximalLength 384                              // 07 regs
+//#define Block_reg_updateControlPointPosition 512                    // 08 regs
+//#define Block_reg_ApplyConvolutionWindowAlongX 512                  // 14 regs
+//#define Block_reg_ApplyConvolutionWindowAlongY 512                  // 14 regs
+//#define Block_reg_ApplyConvolutionWindowAlongZ 512                  // 15 regs
+///* ************************************************************************ */
+//#endif // __CUDA_ARCH__ >= 200
 
 #if CUDART_VERSION >= 3200
 #define NR_CUDA_SAFE_CALL(call) { \

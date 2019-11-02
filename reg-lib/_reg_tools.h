@@ -29,6 +29,8 @@
 #ifndef M_PI
     #define M_PI (3.14159265358979323846)
 #endif
+
+#ifndef _MSC_VER
 #ifndef isnan(_X)
     #define isnan(_X) _isnan(_X)
 #endif
@@ -36,8 +38,10 @@
     #define strtof(_s, _t) (float) strtod(_s, _t)
 #endif
 
-template<class PrecisionType> inline int round(PrecisionType x) { return int(x > 0.0 ? (x + 0.5) : (x - 0.5)); }
 template<typename T> inline bool isinf(T value) { return std::numeric_limits<T>::has_infinity && value == std::numeric_limits<T>::infinity(); }
+#endif
+
+template<class PrecisionType> inline int round(PrecisionType x) { return int(x > 0.0 ? (x + 0.5) : (x - 0.5)); }
 inline int fabs(int _x) { return (int)fabs((float)(_x)); }
 
 #endif //If on windows...

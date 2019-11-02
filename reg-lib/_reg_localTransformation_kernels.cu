@@ -19,11 +19,33 @@ __device__ __constant__ int c_VoxelNumber;
 __device__ __constant__ int c_ControlPointNumber;
 __device__ __constant__ int3 c_ReferenceImageDim;
 __device__ __constant__ int3 c_ControlPointImageDim;
+__device__ __constant__ int3 c_tilesDim;
+__device__ __constant__ float3 c_tilesDim_f;
 __device__ __constant__ float3 c_ControlPointVoxelSpacing;
+__device__ __constant__ int3 c_controlPointVoxelSpacingInt;
 __device__ __constant__ float3 c_ControlPointSpacing;
 __device__ __constant__ float3 c_ReferenceSpacing;
 __device__ __constant__ float c_Weight;
 __device__ __constant__ int c_ActiveVoxelNumber;
+__device__ __constant__ float c_xBasis[NUM_C*MAX_CURRENT_SPACE];
+__device__ __constant__ float c_yBasis[NUM_C*MAX_CURRENT_SPACE];
+__device__ __constant__ float c_zBasis[NUM_C*MAX_CURRENT_SPACE];
+__device__ __constant__ float c_x_g0[MAX_CURRENT_SPACE];
+__device__ __constant__ float c_x_h0[MAX_CURRENT_SPACE];
+__device__ __constant__ float c_x_h1[MAX_CURRENT_SPACE];
+__device__ __constant__ float c_y_g0[MAX_CURRENT_SPACE];
+__device__ __constant__ float c_y_h0[MAX_CURRENT_SPACE];
+__device__ __constant__ float c_y_h1[MAX_CURRENT_SPACE];
+__device__ __constant__ float c_z_g0[MAX_CURRENT_SPACE];
+__device__ __constant__ float c_z_h0[MAX_CURRENT_SPACE];
+__device__ __constant__ float c_z_h1[MAX_CURRENT_SPACE];
+__device__ __constant__ float c_x_h0_r[MAX_CURRENT_SPACE];
+__device__ __constant__ float c_x_h1_r[MAX_CURRENT_SPACE];
+__device__ __constant__ float c_y_h0_r[MAX_CURRENT_SPACE];
+__device__ __constant__ float c_y_h1_r[MAX_CURRENT_SPACE];
+__device__ __constant__ float c_z_h0_r[MAX_CURRENT_SPACE];
+__device__ __constant__ float c_z_h1_r[MAX_CURRENT_SPACE];
+__device__ __constant__ float c_x_h01_r[MAX_CURRENT_SPACE*2];
 __device__ __constant__ bool c_Type;
 __device__ __constant__ float3 c_AffineMatrix0;
 __device__ __constant__ float3 c_AffineMatrix1;
@@ -37,6 +59,7 @@ __device__ __constant__ float4 c_AffineMatrix2c;
 /* *************************************************************** */
 /* *************************************************************** */
 texture<float4, 1, cudaReadModeElementType> controlPointTexture;
+texture<float4, cudaTextureType3D, cudaReadModeElementType> controlPoints3Dtex;
 texture<float4, 1, cudaReadModeElementType> secondDerivativesTexture;
 texture<int, 1, cudaReadModeElementType> maskTexture;
 texture<float,1, cudaReadModeElementType> jacobianDeterminantTexture;
@@ -298,8 +321,8 @@ __device__ void GetSecondDerivativeBasisValues(int index,
     }
 }
 /* *************************************************************** */
-/* *************************************************************** */
-__global__ void reg_bspline_getDeformationField(float4 *positionField)
+/* ********************* Original NiftyReg ************************* */
+__global__ void reg_bspline_getDeformationField0(float4 *positionField)
 {
     __shared__ float zBasis[Block_reg_bspline_getDeformationField*4];
     __shared__ float yBasis[Block_reg_bspline_getDeformationField*4];
@@ -383,6 +406,251 @@ __global__ void reg_bspline_getDeformationField(float4 *positionField)
     return;
 }
 /* *************************************************************** */
+/* ******************************* Thread per Tile with Linear Interpolation ******************************** */
+__global__ void reg_bspline_getDeformationField(float4 *positionField, float4 *controlPoint)
+{
+    int3 controlPointImageDim = c_ControlPointImageDim;
+    int3 tilesDim = c_tilesDim;
+
+    int3 nodeAnte;
+    nodeAnte.z = blockIdx.z * blockDim.z + threadIdx.z;
+    nodeAnte.y = blockIdx.y * blockDim.y + threadIdx.y;
+    nodeAnte.x = blockIdx.x * blockDim.x + threadIdx.x;
+
+    const unsigned int tid = threadIdx.z*blockDim.y*blockDim.x + threadIdx.y*blockDim.x+threadIdx.x;
+
+    //The following line exists in ptx, but not sass. Since it is not known during compilation time it makes the compiler
+    //to change the way it allocates the registers and and in some cases removes possible register spills.
+    for (int i = 3; i < 4; i+= warpSize) {}
+
+    //put to registers
+    float3 nodeCoefficientA[NUM_C*NUM_C], nodeCoefficientB[NUM_C*NUM_C], nodeCoefficientC[NUM_C*NUM_C];
+    __shared__ float3 nodeCoefficientD[NUM_C*NUM_C*BLOCK_SIZE];
+    for(int c=0; c<NUM_C; c++){
+        for(int b=0; b<NUM_C; b++){
+            int indexXYZ = ( (nodeAnte.z + c) * controlPointImageDim.y + nodeAnte.y+b) * controlPointImageDim.x + nodeAnte.x;
+
+            float4 temp;
+
+            temp = tex1Dfetch(controlPointTexture,indexXYZ);
+            nodeCoefficientA[b + NUM_C*c] = make_float3(temp.x, temp.y, temp.z);
+            indexXYZ++;
+
+            temp = tex1Dfetch(controlPointTexture,indexXYZ);
+            nodeCoefficientB[b + NUM_C*c] = make_float3(temp.x, temp.y, temp.z);
+            indexXYZ++;
+
+            temp = tex1Dfetch(controlPointTexture,indexXYZ);
+            nodeCoefficientC[b + NUM_C*c] = make_float3(temp.x, temp.y, temp.z);
+            indexXYZ++;
+
+            temp = tex1Dfetch(controlPointTexture,indexXYZ);
+            nodeCoefficientD[(b + NUM_C*c)*BLOCK_SIZE + tid] = make_float3(temp.x, temp.y, temp.z);
+        }
+    }
+
+    if(nodeAnte.x < tilesDim.x && nodeAnte.y < tilesDim.y && nodeAnte.z < tilesDim.z ){
+
+        int3 imageSize = c_ReferenceImageDim;
+
+        int3 gridVoxelSpacing = c_controlPointVoxelSpacingInt;
+
+        for (int k = 0; k < gridVoxelSpacing.z; ++k) {
+            for (int j = 0; j < gridVoxelSpacing.y; ++j) {
+                for (int i = 0; i < gridVoxelSpacing.x; ++i) {
+                    float3 c000_,c001_,c010_,c011_,c100_,c101_,c110_,c111_;
+
+                    c000_ = nodeCoefficientA[0*NUM_C];
+                    c001_ = nodeCoefficientA[0*NUM_C+NUM_C];
+                    c010_ = nodeCoefficientA[0*NUM_C+1];
+                    c011_ = nodeCoefficientA[0*NUM_C+NUM_C+1];
+                    c100_ = nodeCoefficientB[0*NUM_C];
+                    c101_ = nodeCoefficientB[0*NUM_C+NUM_C];
+                    c110_ = nodeCoefficientB[0*NUM_C+1];
+                    c111_ = nodeCoefficientB[0*NUM_C+NUM_C+1];
+
+                    c000_ = c000_ + c_z_h0_r[k]*(c001_-c000_);
+                    c010_ = c010_ + c_z_h0_r[k]*(c011_-c010_);
+                    c100_ = c100_ + c_z_h0_r[k]*(c101_-c100_);
+                    c110_ = c110_ + c_z_h0_r[k]*(c111_-c110_);
+
+                    c000_ = c000_ + c_y_h0_r[j]*(c010_-c000_);
+                    c100_ = c100_ + c_y_h0_r[j]*(c110_-c100_);
+
+                    float3 c000;
+                    c000 =  c000_ + c_x_h0_r[i]*(c100_-c000_);
+
+                    c000_ = nodeCoefficientA[2*NUM_C];
+                    c001_ = nodeCoefficientA[2*NUM_C+NUM_C];
+                    c010_ = nodeCoefficientA[2*NUM_C+1];
+                    c011_ = nodeCoefficientA[2*NUM_C+NUM_C+1];
+                    c100_ = nodeCoefficientB[2*NUM_C];
+                    c101_ = nodeCoefficientB[2*NUM_C+NUM_C];
+                    c110_ = nodeCoefficientB[2*NUM_C+1];
+                    c111_ = nodeCoefficientB[2*NUM_C+NUM_C+1];
+
+                    c000_ = c000_ + c_z_h1_r[k]*(c001_-c000_);
+                    c010_ = c010_ + c_z_h1_r[k]*(c011_-c010_);
+                    c100_ = c100_ + c_z_h1_r[k]*(c101_-c100_);
+                    c110_ = c110_ + c_z_h1_r[k]*(c111_-c110_);
+
+                    c000_ = c000_ + c_y_h0_r[j]*(c010_-c000_);
+                    c100_ = c100_ + c_y_h0_r[j]*(c110_-c100_);
+
+                    float3 c001;
+                    c001 =  c000_ + c_x_h0_r[i]*(c100_-c000_);
+
+                    c000_ = nodeCoefficientA[0*NUM_C+2];
+                    c001_ = nodeCoefficientA[0*NUM_C+NUM_C+2];
+                    c010_ = nodeCoefficientA[0*NUM_C+1+2];
+                    c011_ = nodeCoefficientA[0*NUM_C+NUM_C+1+2];
+                    c100_ = nodeCoefficientB[0*NUM_C+2];
+                    c101_ = nodeCoefficientB[0*NUM_C+NUM_C+2];
+                    c110_ = nodeCoefficientB[0*NUM_C+1+2];
+                    c111_ = nodeCoefficientB[0*NUM_C+NUM_C+1+2];
+
+                    c000_ = c000_ + c_z_h0_r[k]*(c001_-c000_);
+                    c010_ = c010_ + c_z_h0_r[k]*(c011_-c010_);
+                    c100_ = c100_ + c_z_h0_r[k]*(c101_-c100_);
+                    c110_ = c110_ + c_z_h0_r[k]*(c111_-c110_);
+
+                    c000_ = c000_ + c_y_h1_r[j]*(c010_-c000_);
+                    c100_ = c100_ + c_y_h1_r[j]*(c110_-c100_);
+
+                    float3 c010;
+                    c010 =  c000_ + c_x_h0_r[i]*(c100_-c000_);
+
+                    c000_ = nodeCoefficientA[2*NUM_C+2];
+                    c001_ = nodeCoefficientA[2*NUM_C+NUM_C+2];
+                    c010_ = nodeCoefficientA[2*NUM_C+1+2];
+                    c011_ = nodeCoefficientA[2*NUM_C+NUM_C+1+2];
+                    c100_ = nodeCoefficientB[2*NUM_C+2];
+                    c101_ = nodeCoefficientB[2*NUM_C+NUM_C+2];
+                    c110_ = nodeCoefficientB[2*NUM_C+1+2];
+                    c111_ = nodeCoefficientB[2*NUM_C+NUM_C+1+2];
+
+                    c000_ = c000_ + c_z_h1_r[k]*(c001_-c000_);
+                    c010_ = c010_ + c_z_h1_r[k]*(c011_-c010_);
+                    c100_ = c100_ + c_z_h1_r[k]*(c101_-c100_);
+                    c110_ = c110_ + c_z_h1_r[k]*(c111_-c110_);
+
+                    c000_ = c000_ + c_y_h1_r[j]*(c010_-c000_);
+                    c100_ = c100_ + c_y_h1_r[j]*(c110_-c100_);
+
+                    float3 c011;
+                    c011 =  c000_ + c_x_h0_r[i]*(c100_-c000_);
+
+                    c000_ = nodeCoefficientC[0*NUM_C];
+                    c001_ = nodeCoefficientC[0*NUM_C+NUM_C];
+                    c010_ = nodeCoefficientC[0*NUM_C+1];
+                    c011_ = nodeCoefficientC[0*NUM_C+NUM_C+1];
+                    c100_ = nodeCoefficientD[0*NUM_C*BLOCK_SIZE + tid];
+                    c101_ = nodeCoefficientD[(0*NUM_C+NUM_C)*BLOCK_SIZE + tid];
+                    c110_ = nodeCoefficientD[(0*NUM_C+1)*BLOCK_SIZE + tid];
+                    c111_ = nodeCoefficientD[(0*NUM_C+NUM_C+1)*BLOCK_SIZE + tid];
+
+                    c000_ = c000_ + c_z_h0_r[k]*(c001_-c000_);
+                    c010_ = c010_ + c_z_h0_r[k]*(c011_-c010_);
+                    c100_ = c100_ + c_z_h0_r[k]*(c101_-c100_);
+                    c110_ = c110_ + c_z_h0_r[k]*(c111_-c110_);
+
+                    c000_ = c000_ + c_y_h0_r[j]*(c010_-c000_);
+                    c100_ = c100_ + c_y_h0_r[j]*(c110_-c100_);
+
+                    float3 c100;
+                    c100 =  c000_ + c_x_h1_r[i]*(c100_-c000_);
+
+                    c000_ = nodeCoefficientC[2*NUM_C];
+                    c001_ = nodeCoefficientC[2*NUM_C+NUM_C];
+                    c010_ = nodeCoefficientC[2*NUM_C+1];
+                    c011_ = nodeCoefficientC[2*NUM_C+NUM_C+1];
+                    c100_ = nodeCoefficientD[2*NUM_C*BLOCK_SIZE + tid];
+                    c101_ = nodeCoefficientD[(2*NUM_C+NUM_C)*BLOCK_SIZE + tid];
+                    c110_ = nodeCoefficientD[(2*NUM_C+1)*BLOCK_SIZE + tid];
+                    c111_ = nodeCoefficientD[(2*NUM_C+NUM_C+1)*BLOCK_SIZE + tid];
+
+                    c000_ = c000_ + c_z_h1_r[k]*(c001_-c000_);
+                    c010_ = c010_ + c_z_h1_r[k]*(c011_-c010_);
+                    c100_ = c100_ + c_z_h1_r[k]*(c101_-c100_);
+                    c110_ = c110_ + c_z_h1_r[k]*(c111_-c110_);
+
+                    c000_ = c000_ + c_y_h0_r[j]*(c010_-c000_);
+                    c100_ = c100_ + c_y_h0_r[j]*(c110_-c100_);
+
+                    float3 c101;
+                    c101 =  c000_ + c_x_h1_r[i]*(c100_-c000_);
+
+                    c000_ = nodeCoefficientC[0*NUM_C+2];
+                    c001_ = nodeCoefficientC[0*NUM_C+NUM_C+2];
+                    c010_ = nodeCoefficientC[0*NUM_C+1+2];
+                    c011_ = nodeCoefficientC[0*NUM_C+NUM_C+1+2];
+                    c100_ = nodeCoefficientD[(0*NUM_C+2)*BLOCK_SIZE + tid];
+                    c101_ = nodeCoefficientD[(0*NUM_C+NUM_C+2)*BLOCK_SIZE + tid];
+                    c110_ = nodeCoefficientD[(0*NUM_C+1+2)*BLOCK_SIZE + tid];
+                    c111_ = nodeCoefficientD[(0*NUM_C+NUM_C+1+2)*BLOCK_SIZE + tid];
+
+                    c000_ = c000_ + c_z_h0_r[k]*(c001_-c000_);
+                    c010_ = c010_ + c_z_h0_r[k]*(c011_-c010_);
+                    c100_ = c100_ + c_z_h0_r[k]*(c101_-c100_);
+                    c110_ = c110_ + c_z_h0_r[k]*(c111_-c110_);
+
+                    c000_ = c000_ + c_y_h1_r[j]*(c010_-c000_);
+                    c100_ = c100_ + c_y_h1_r[j]*(c110_-c100_);
+
+                    float3 c110;
+                    c110 =  c000_ + c_x_h1_r[i]*(c100_-c000_);
+
+                    c000_ = nodeCoefficientC[2*NUM_C+2];
+                    c001_ = nodeCoefficientC[2*NUM_C+NUM_C+2];
+                    c010_ = nodeCoefficientC[2*NUM_C+1+2];
+                    c011_ = nodeCoefficientC[2*NUM_C+NUM_C+1+2];
+                    c100_ = nodeCoefficientD[(2*NUM_C+2)*BLOCK_SIZE + tid];
+                    c101_ = nodeCoefficientD[(2*NUM_C+NUM_C+2)*BLOCK_SIZE + tid];
+                    c110_ = nodeCoefficientD[(2*NUM_C+1+2)*BLOCK_SIZE + tid];
+                    c111_ = nodeCoefficientD[(2*NUM_C+NUM_C+1+2)*BLOCK_SIZE + tid];
+
+                    c000_ = c000_ + c_z_h1_r[k]*(c001_-c000_);
+                    c010_ = c010_ + c_z_h1_r[k]*(c011_-c010_);
+                    c100_ = c100_ + c_z_h1_r[k]*(c101_-c100_);
+                    c110_ = c110_ + c_z_h1_r[k]*(c111_-c110_);
+
+                    c000_ = c000_ + c_y_h1_r[j]*(c010_-c000_);
+                    c100_ = c100_ + c_y_h1_r[j]*(c110_-c100_);
+
+                    float3 c111;
+                    c111 =  c000_ + c_x_h1_r[i]*(c100_-c000_);
+
+
+                    c000 = c001 + c_z_g0[k]*(c000-c001);
+                    c010 = c011 + c_z_g0[k]*(c010-c011);
+                    c100 = c101 + c_z_g0[k]*(c100-c101);
+                    c110 = c111 + c_z_g0[k]*(c110-c111);
+
+                    c000 = c010 + c_y_g0[j]*(c000-c010);
+                    c100 = c110 + c_y_g0[j]*(c100-c110);
+
+                    c000 = c100 + c_x_g0[i]*(c000-c100);
+
+                    float4 displacement=make_float4(0.0f,0.0f,0.0f,0.0f);
+                    displacement.x = c000.x;
+                    displacement.y = c000.y;
+                    displacement.z = c000.z;
+
+                    uint3 imgCoord;
+                    imgCoord.z = nodeAnte.z*gridVoxelSpacing.z+k;
+                    imgCoord.y = nodeAnte.y*gridVoxelSpacing.y+j;
+                    imgCoord.x = nodeAnte.x*gridVoxelSpacing.x+i;
+                    unsigned int tmp_index = imgCoord.z*imageSize.x*imageSize.y + imgCoord.y*imageSize.x + imgCoord.x;
+                    if (imgCoord.z < imageSize.z && imgCoord.y < imageSize.y && imgCoord.x < imageSize.x)
+                        positionField[tmp_index] = displacement;
+
+                }
+            }
+        }
+
+    }
+    return;
+}
 /* *************************************************************** */
 __global__ void reg_bspline_getApproxSecondDerivatives(float4 *secondDerivativeValues)
 {

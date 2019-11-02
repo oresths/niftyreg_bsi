@@ -122,6 +122,10 @@ endif(USE_DOUBLE)
 
 if(USE_SSE)
     add_definitions(-D_USE_SSE)
+    if ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU")
+        set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -march=native")
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=native")
+    endif ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU")
 endif(USE_SSE)
 
 if(BUILD_NR_DEV)
