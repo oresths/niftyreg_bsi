@@ -25,6 +25,18 @@
 	#include <emmintrin.h>
 #endif
 
+#include "cudalike_math.h"
+#include "vectorclass/vectorclass.h"
+
+#define NUM_C 4
+//Distance in pixels for control points ! it may be different in different dimensions !!! The spacing could be different
+// -> from the input arguments to the program if the input has to be downsampled (if one of the (dimension/2 < 32))
+//Mainly helps to allocate memory. Should be double the desired maximum in case there is downsampling.
+// - see reg_createImagePyramid
+#define MAX_CURRENT_SPACE 32
+#define VECTOR_ELEM 8 // Number of elements per vector
+#define NUM_THREADS 8
+
 
 /* *********************************************** */
 /* ****      CUBIC SPLINE BASED FUNCTIONS     **** */
@@ -62,6 +74,22 @@ void reg_createControlPointGrid(nifti_image **controlPointGridImage,
  */
 extern "C++"
 void reg_spline_getDeformationField(nifti_image *controlPointGridImage,
+                                    nifti_image *referenceImage,
+                                    nifti_image *deformationField,
+                                    int *mask,
+                                    bool composition,
+                                    bool bspline
+                                    );
+extern "C++"
+void reg_spline_getDeformationField_testing(nifti_image *controlPointGridImage,
+                                    nifti_image *referenceImage,
+                                    nifti_image *deformationField,
+                                    int *mask,
+                                    bool composition,
+                                    bool bspline
+                                    );
+extern "C++"
+void reg_spline_getDeformationField_test_reg(nifti_image *controlPointGridImage,
                                     nifti_image *referenceImage,
                                     nifti_image *deformationField,
                                     int *mask,

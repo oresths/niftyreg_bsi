@@ -161,7 +161,9 @@ int main(int argc, char **argv)
         PetitUsage(argv[0]);
         return 1;
     }
-    time_t start; time(&start);
+//    time_t start; time(&start);
+    timespec startCPU, stopCPU;
+    clock_gettime(CLOCK_MONOTONIC_RAW, &startCPU);
 
     char *referenceName=NULL;
     char *floatingName=NULL;
@@ -960,14 +962,17 @@ int main(int argc, char **argv)
 #ifdef NDEBUG
     if(verbose){
 #endif
-        time_t end; time( &end );
-        int minutes = (int)floorf(float(end-start)/60.0f);
-        int seconds = (int)(end-start - 60*minutes);
+//        time_t end; time( &end );
+//        int minutes = (int)floorf(float(end-start)/60.0f);
+//        int seconds = (int)(end-start - 60*minutes);
+        clock_gettime(CLOCK_MONOTONIC_RAW, &stopCPU);
+        double accum = ( stopCPU.tv_sec - startCPU.tv_sec ) * 1000L + (double)( stopCPU.tv_nsec - startCPU.tv_nsec ) / 1000000L;
 
 #ifdef _USE_CUDA
         if(!checkMem){
 #endif
-            printf("[NiftyReg F3D] Registration Performed in %i min %i sec\n", minutes, seconds);
+//            printf("[NiftyReg F3D] Registration Performed in %i min %i sec\n", minutes, seconds);
+            printf("[NiftyReg F3D] Registration Performed in %lf ms\n", accum);
             printf("[NiftyReg F3D] Have a good day !\n");
 #ifdef _USE_CUDA
         }

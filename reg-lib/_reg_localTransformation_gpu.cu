@@ -15,6 +15,10 @@
 #include "_reg_localTransformation_gpu.h"
 #include "_reg_localTransformation_kernels.cu"
 
+#include "localTransformation.h"
+
+#include <stdio.h>
+
 /* *************************************************************** */
 /* *************************************************************** */
 void reg_bspline_gpu(nifti_image *controlPointImage,
@@ -50,11 +54,567 @@ void reg_bspline_gpu(nifti_image *controlPointImage,
         (unsigned int)ceilf(sqrtf((float)activeVoxelNumber/(float)(Block_reg_bspline_getDeformationField)));
     dim3 G1(Grid_reg_bspline_getDeformationField,Grid_reg_bspline_getDeformationField,1);
     dim3 B1(Block_reg_bspline_getDeformationField,1,1);
-    reg_bspline_getDeformationField <<< G1, B1 >>>(*positionFieldImageArray_d);
+	reg_bspline_getDeformationField0 <<< G1, B1 >>>(*positionFieldImageArray_d);
     NR_CUDA_CHECK_KERNEL(G1,B1)
 
     NR_CUDA_SAFE_CALL(cudaUnbindTexture(controlPointTexture))
     NR_CUDA_SAFE_CALL(cudaUnbindTexture(maskTexture))
+    return;
+}
+/* *************************************************************** */
+/* ************* Here we evaluate the performance of the GPU B-spline interpolation implementations ************ */
+void reg_bspline_testing(nifti_image *controlPointImage,
+                     nifti_image *reference,
+                     float4 **controlPointImageArray_d,
+                     float4 **positionFieldImageArray_d,
+                     int **mask_d,
+                     int activeVoxelNumber,
+                     bool bspline)
+{
+    const int voxelNumber = reference->nx * reference->ny * reference->nz;
+    const int controlPointNumber = controlPointImage->nx*controlPointImage->ny*controlPointImage->nz;
+    const int3 referenceImageDim = make_int3(reference->nx, reference->ny, reference->nz);
+    const int3 controlPointImageDim = make_int3(controlPointImage->nx, controlPointImage->ny, controlPointImage->nz);
+    const int useBSpline = bspline;
+
+    const float3 controlPointVoxelSpacing = make_float3(
+        controlPointImage->dx / reference->dx,
+        controlPointImage->dy / reference->dy,
+        controlPointImage->dz / reference->dz);
+    const int3 controlPointVoxelSpacingInt = make_int3(
+        lrintf( controlPointImage->dx / reference->dx ),
+        lrintf( controlPointImage->dy / reference->dy ),
+        lrintf( controlPointImage->dz / reference->dz ));
+
+    const int3_t referenceImageDimCPU = make_int3_t(reference->nx, reference->ny, reference->nz);
+    const int3_t controlPointImageDimCPU = make_int3_t(controlPointImage->nx, controlPointImage->ny, controlPointImage->nz);
+
+    const float3_t controlPointVoxelSpacingCPU = make_float3_t(
+        controlPointImage->dx / reference->dx,
+        controlPointImage->dy / reference->dy,
+        controlPointImage->dz / reference->dz);
+
+    //Doesn't affect a lot, but I/O is preallocated to avoid page faults
+    float4_t * positionFieldImageArray_h = (float4_t *)calloc(
+            referenceImageDimCPU.x*referenceImageDimCPU.y*referenceImageDimCPU.z , sizeof(float4_t));
+
+    float4_t *controlPointImageArray_h=(float4_t *)malloc(controlPointNumber * sizeof(float4_t));
+
+    const size_t controlCount(controlPointNumber);
+    const size_t controlMemory(controlCount * sizeof(float4_t));
+    float4_t* controlTemp = new float4_t[controlCount];
+
+    NR_CUDA_SAFE_CALL(cudaMemcpy(controlTemp, *controlPointImageArray_d, controlMemory, cudaMemcpyDeviceToHost))
+
+    for(int i=0; i<controlPointNumber; i++){
+        controlPointImageArray_h[i] = controlTemp[i];
+    }
+
+    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_UseBSpline,&useBSpline,sizeof(int)))
+    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_VoxelNumber,&voxelNumber,sizeof(int)))
+    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_ReferenceImageDim,&referenceImageDim,sizeof(int3)))
+    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_ControlPointImageDim,&controlPointImageDim,sizeof(int3)))
+    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_ControlPointVoxelSpacing,&controlPointVoxelSpacing,sizeof(float3)))
+    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_controlPointVoxelSpacingInt,&controlPointVoxelSpacingInt,sizeof(float3)))
+    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_ActiveVoxelNumber,&activeVoxelNumber,sizeof(int)))
+
+    NR_CUDA_SAFE_CALL(cudaBindTexture(0, controlPointTexture, *controlPointImageArray_d, controlPointNumber*sizeof(float4)))
+    NR_CUDA_SAFE_CALL(cudaBindTexture(0, maskTexture, *mask_d, activeVoxelNumber*sizeof(int)))
+
+    cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc(32, 32, 32, 32, cudaChannelFormatKindFloat);
+    cudaArray_t controlPoints3D;
+    NR_CUDA_SAFE_CALL(cudaMalloc3DArray(&controlPoints3D, &channelDesc,
+            make_cudaExtent(controlPointImage->nx, controlPointImage->ny, controlPointImage->nz)))
+
+    cudaMemcpy3DParms pars3D = {0};
+    pars3D.dstArray = controlPoints3D;
+    cudaExtent ext = make_cudaExtent(controlPointImage->nx, controlPointImage->ny, controlPointImage->nz);
+    pars3D.extent = ext;
+    pars3D.kind = cudaMemcpyDeviceToDevice;
+    pars3D.srcPtr = make_cudaPitchedPtr(*controlPointImageArray_d, controlPointImage->nx*sizeof(float4),
+            controlPointImage->nx, controlPointImage->ny);
+
+    NR_CUDA_SAFE_CALL( cudaMemcpy3D(&pars3D) )
+
+    controlPoints3Dtex.filterMode = cudaFilterModeLinear;
+    cudaBindTextureToArray(&controlPoints3Dtex, controlPoints3D, &channelDesc);
+
+    const int3 tilesDim = make_int3(ceilf((float)reference->nx / (float)controlPointVoxelSpacing.x),
+                                    ceilf((float)reference->ny / (float)controlPointVoxelSpacing.y),
+                                    ceilf((float)reference->nz / (float)controlPointVoxelSpacing.z));
+    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_tilesDim,&tilesDim,sizeof(int3)))
+
+    const float3 tilesDim_f = make_float3((float)reference->nx / (float)controlPointVoxelSpacing.x,
+                                          (float)reference->ny / (float)controlPointVoxelSpacing.y,
+                                          (float)reference->nz / (float)controlPointVoxelSpacing.z);
+    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_tilesDim_f,&tilesDim_f,sizeof(float3)))
+
+    float x_g0[MAX_CURRENT_SPACE];
+    float x_h0[MAX_CURRENT_SPACE];
+    float x_h1[MAX_CURRENT_SPACE];
+    float y_g0[MAX_CURRENT_SPACE];
+    float y_h0[MAX_CURRENT_SPACE];
+    float y_h1[MAX_CURRENT_SPACE];
+    float z_g0[MAX_CURRENT_SPACE];
+    float z_h0[MAX_CURRENT_SPACE];
+    float z_h1[MAX_CURRENT_SPACE];
+    float x_h0_r[MAX_CURRENT_SPACE];
+    float x_h1_r[MAX_CURRENT_SPACE];
+    float y_h0_r[MAX_CURRENT_SPACE];
+    float y_h1_r[MAX_CURRENT_SPACE];
+    float z_h0_r[MAX_CURRENT_SPACE];
+    float z_h1_r[MAX_CURRENT_SPACE];
+    float x_h01_r[MAX_CURRENT_SPACE*2];
+    float xBasis[NUM_C*MAX_CURRENT_SPACE];
+    float yBasis[NUM_C*MAX_CURRENT_SPACE];
+    float zBasis[NUM_C*MAX_CURRENT_SPACE];
+    float relative;
+    for (int i = 0; i < controlPointVoxelSpacingInt.x; ++i) {
+        relative = (float) i / controlPointVoxelSpacing.x;
+        float FF= relative*relative;
+        float FFF= FF*relative;
+        float MF=1.f-relative;
+        xBasis[0+NUM_C*i] = (MF)*(MF)*(MF)/(6.f);
+        xBasis[1+NUM_C*i] = (3.f*FFF - 6.f*FF + 4.f)/6.f;
+        xBasis[2+NUM_C*i] = (-3.f*FFF + 3.f*FF + 3.f*relative + 1.f)/6.f;
+        xBasis[3+NUM_C*i] = (FFF/6.f);
+
+        x_g0[i] = xBasis[0+NUM_C*i] + xBasis[1+NUM_C*i];
+        x_h0[i] = xBasis[1+NUM_C*i] / (x_g0[i]) - 1;
+        x_h1[i] = xBasis[3+NUM_C*i] / (1 - x_g0[i]) + 1;
+
+        x_h0_r[i] = xBasis[1+NUM_C*i] / (x_g0[i]);
+        x_h1_r[i] = xBasis[3+NUM_C*i] / (1 - x_g0[i]);
+
+        x_h01_r[i] = x_h0_r[i];
+        x_h01_r[i+(int)controlPointVoxelSpacingInt.x] = x_h1_r[i];
+    }
+    for (int i = 0; i < controlPointVoxelSpacingInt.y; ++i) {
+        relative = (float) i / controlPointVoxelSpacing.y;
+        float FF= relative*relative;
+        float FFF= FF*relative;
+        float MF=1.f-relative;
+        yBasis[0+NUM_C*i] = (MF)*(MF)*(MF)/(6.f);
+        yBasis[1+NUM_C*i] = (3.f*FFF - 6.f*FF + 4.f)/6.f;
+        yBasis[2+NUM_C*i] = (-3.f*FFF + 3.f*FF + 3.f*relative + 1.f)/6.f;
+        yBasis[3+NUM_C*i] = (FFF/6.f);
+
+        y_g0[i] = yBasis[0+NUM_C*i] + yBasis[1+NUM_C*i];
+        y_h0[i] = yBasis[1+NUM_C*i] / (y_g0[i]) - 1;
+        y_h1[i] = yBasis[3+NUM_C*i] / (1 - y_g0[i]) + 1;
+
+        y_h0_r[i] = yBasis[1+NUM_C*i] / (y_g0[i]);
+        y_h1_r[i] = yBasis[3+NUM_C*i] / (1 - y_g0[i]);
+    }
+    for (int i = 0; i < controlPointVoxelSpacingInt.z; ++i) {
+        relative = (float) i / controlPointVoxelSpacing.z;
+        float FF= relative*relative;
+        float FFF= FF*relative;
+        float MF=1.f-relative;
+        zBasis[0+NUM_C*i] = (MF)*(MF)*(MF)/(6.f);
+        zBasis[1+NUM_C*i] = (3.f*FFF - 6.f*FF + 4.f)/6.f;
+        zBasis[2+NUM_C*i] = (-3.f*FFF + 3.f*FF + 3.f*relative + 1.f)/6.f;
+        zBasis[3+NUM_C*i] = (FFF/6.f);
+
+        z_g0[i] = zBasis[0+NUM_C*i] + zBasis[1+NUM_C*i];
+        z_h0[i] = zBasis[1+NUM_C*i] / (z_g0[i]) - 1;
+        z_h1[i] = zBasis[3+NUM_C*i] / (1 - z_g0[i]) + 1;
+
+        z_h0_r[i] = zBasis[1+NUM_C*i] / (z_g0[i]);
+        z_h1_r[i] = zBasis[3+NUM_C*i] / (1 - z_g0[i]);
+    }
+
+    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_xBasis,&xBasis,NUM_C*MAX_CURRENT_SPACE*sizeof(float)))
+    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_yBasis,&yBasis,NUM_C*MAX_CURRENT_SPACE*sizeof(float)))
+    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_zBasis,&zBasis,NUM_C*MAX_CURRENT_SPACE*sizeof(float)))
+
+    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_x_g0,&x_g0,MAX_CURRENT_SPACE*sizeof(float)))
+    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_x_h0,&x_h0,MAX_CURRENT_SPACE*sizeof(float)))
+    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_x_h1,&x_h1,MAX_CURRENT_SPACE*sizeof(float)))
+    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_y_g0,&y_g0,MAX_CURRENT_SPACE*sizeof(float)))
+    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_y_h0,&y_h0,MAX_CURRENT_SPACE*sizeof(float)))
+    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_y_h1,&y_h1,MAX_CURRENT_SPACE*sizeof(float)))
+    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_z_g0,&z_g0,MAX_CURRENT_SPACE*sizeof(float)))
+    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_z_h0,&z_h0,MAX_CURRENT_SPACE*sizeof(float)))
+    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_z_h1,&z_h1,MAX_CURRENT_SPACE*sizeof(float)))
+
+    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_x_h0_r,&x_h0_r,MAX_CURRENT_SPACE*sizeof(float)))
+    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_x_h1_r,&x_h1_r,MAX_CURRENT_SPACE*sizeof(float)))
+    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_y_h0_r,&y_h0_r,MAX_CURRENT_SPACE*sizeof(float)))
+    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_y_h1_r,&y_h1_r,MAX_CURRENT_SPACE*sizeof(float)))
+    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_z_h0_r,&z_h0_r,MAX_CURRENT_SPACE*sizeof(float)))
+    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_z_h1_r,&z_h1_r,MAX_CURRENT_SPACE*sizeof(float)))
+
+    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_x_h01_r,&x_h01_r,MAX_CURRENT_SPACE*2*sizeof(float)))
+
+    const unsigned int Grid_reg_bspline_getDeformationField0 =
+        (unsigned int)ceilf(sqrtf((float)activeVoxelNumber/(float)(Block_reg_bspline_getDeformationField)));
+    dim3 G0(Grid_reg_bspline_getDeformationField0,Grid_reg_bspline_getDeformationField0,1);
+    dim3 B0(256,1,1);
+
+    const dim3 BD(8, 8, 4);
+    const dim3 GD(ceilf((float)referenceImageDim.x / BD.x), ceilf((float)referenceImageDim.y / BD.y),
+            ceilf((float)referenceImageDim.z / BD.z));
+
+    unsigned int block_size = 128;
+    const unsigned int Grid_reg_bspline_getDeformationField =
+            (unsigned int) ceilf((float)(tilesDim.x * tilesDim.y * tilesDim.z) / block_size);
+
+    dim3 G1(Grid_reg_bspline_getDeformationField,1,1);
+    dim3 B1(block_size,1,1);
+
+    dim3 B2(BLOCK_BS_X,BLOCK_BS_Y,BLOCK_BS_Z);
+    dim3 G2((unsigned int) ceilf((float)(tilesDim.x) / B2.x),
+            (unsigned int) ceilf((float)(tilesDim.y) / B2.y),
+            (unsigned int) ceilf((float)(tilesDim.z) / B2.z));
+
+    dim3 G3(tilesDim.x, tilesDim.y, tilesDim.z);
+
+    dim3 B5((int)(ceilf((float)(controlPointVoxelSpacing.y * controlPointVoxelSpacing.z) / 2.f))
+            * controlPointVoxelSpacing.x,1,1);
+    dim3 B6((int)(ceilf((float)(controlPointVoxelSpacing.y * controlPointVoxelSpacing.z) / 4.f))
+            * controlPointVoxelSpacing.x,1,1);
+
+    FILE *f = fopen("results.txt", "a"); //id, level, data_in, execution, data_out, accuracy, errors
+    if (f == NULL)
+    {
+        printf("Error opening file!\n");
+        exit(1);
+    }
+
+    static int level;
+    static int currentVoxelNumber = 0;
+    if (currentVoxelNumber == 0) {
+        currentVoxelNumber = activeVoxelNumber;
+        level = 0;
+    } else if (activeVoxelNumber > currentVoxelNumber) {
+        currentVoxelNumber = activeVoxelNumber;
+        level++;
+    }
+
+
+#define ID 3 //findme, valid values = 1,2,3,4,5
+
+#if ID == 0
+
+#elif ID
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    cudaChannelFormatDesc channelDescT = cudaCreateChannelDesc(32, 32, 32, 32, cudaChannelFormatKindFloat);
+    cudaArray_t input3D;
+    NR_CUDA_SAFE_CALL(cudaMalloc3DArray(&input3D, &channelDescT, make_cudaExtent(controlPointImageDim.x, controlPointImageDim.y, controlPointImageDim.z)))
+
+    cudaMemcpy3DParms pars3D_T = {0};
+    pars3D_T.dstArray = input3D;
+    cudaExtent ext_T = make_cudaExtent(controlPointImageDim.x, controlPointImageDim.y, controlPointImageDim.z);
+    pars3D_T.extent = ext_T;
+    pars3D_T.kind = cudaMemcpyHostToDevice;
+    pars3D_T.srcPtr = make_cudaPitchedPtr(controlPointImageArray_h, controlPointImageDim.x*sizeof(float4), controlPointImageDim.x, controlPointImageDim.y);
+
+    bool executed = true;
+
+    cudaEventRecord(start);
+
+    NR_CUDA_SAFE_CALL( cudaMemcpy3D(&pars3D_T) )
+
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    float ms_memin = 0;
+    cudaEventElapsedTime(&ms_memin, start, stop);
+
+    float4* preheat;
+    const dim3 BP(8, 8, 4);
+    const dim3 GP(30, 30, 30);
+    NR_CUDA_SAFE_CALL(cudaMalloc((void**)&preheat, BP.x*BP.y*BP.z*sizeof(float4)))
+    for (int i = 0; i < 20000; ++i) {
+        warmup <<< GP, BP >>>(preheat);
+    }
+
+    cudaEventRecord(start);
+
+#if ID == 1
+    reg_bspline_getDeformationFieldTile7_noSh<<<G2, B2 >>>(*positionFieldImageArray_d, *controlPointImageArray_d);
+#endif
+#if ID == 2
+    reg_bspline_getDeformationFieldDanny <<< GD, BD >>>(*positionFieldImageArray_d);
+#endif
+#if ID == 3
+    reg_bspline_getDeformationFieldTileLerp3_noSh<<<G2, B2 >>>(*positionFieldImageArray_d, *controlPointImageArray_d);
+#endif
+#if ID == 4
+    if (B5.x <= 32)
+        reg_bspline_getDeformationFieldTileVoxel6_subWarp <<< G3, B5 >>>(*positionFieldImageArray_d, *controlPointImageArray_d);
+    else if (B5.x <= 1024)
+        reg_bspline_getDeformationFieldTileVoxel6 <<< G3, B5 >>>(*positionFieldImageArray_d, *controlPointImageArray_d);
+    else if (B6.x <= 896) // Can't run more threads because of limited registers (67 per thread for this arch)
+        reg_bspline_getDeformationFieldTileVoxel7 <<< G3, B6 >>>(*positionFieldImageArray_d, *controlPointImageArray_d);
+    else executed = false;
+#endif
+#if ID == 5
+    reg_bspline_getDeformationField0_noMask <<< G0, B0 >>>(*positionFieldImageArray_d);
+#endif
+
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    float ms_box = 0;
+    cudaEventElapsedTime(&ms_box, start, stop);
+
+    printf("**** Bspline kernel time: %fms\n", ms_box);
+
+    NR_CUDA_CHECK_KERNEL(G1,B1)
+
+    const size_t floatCountGPU(activeVoxelNumber);
+    const size_t memoryReqGPU(floatCountGPU * sizeof(float4));
+
+    float4* hostDataFloat4 = new float4[floatCountGPU];
+
+    cudaMemcpy(hostDataFloat4, *positionFieldImageArray_d, memoryReqGPU, cudaMemcpyDeviceToHost);
+
+    float4* mem_test = new float4[floatCountGPU];
+    float4 *mem_test_d;
+    NR_CUDA_SAFE_CALL(cudaMallocHost((void**)&mem_test_d, voxelNumber*sizeof(float4)))
+    NR_CUDA_SAFE_CALL(cudaMemcpy(mem_test_d, *positionFieldImageArray_d, memoryReqGPU, cudaMemcpyDeviceToDevice))
+
+    cudaEventRecord(start);
+    cudaMemcpy(mem_test, mem_test_d, memoryReqGPU, cudaMemcpyDeviceToHost);
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    float ms_memout = 0;
+    cudaEventElapsedTime(&ms_memout, start, stop);
+
+    if (!executed) ms_box = 9999.f;
+    fprintf(f, "%d,%d,%f,%f,%f,", ID, level, ms_memin, ms_box, ms_memout);
+
+#endif
+
+    /************************ test correctness *****************************/
+    reg_bspline_getDeformationField0 <<< G0, B0 >>>(*positionFieldImageArray_d);
+
+    const size_t floatCount(activeVoxelNumber);
+    const size_t memoryReq(floatCount * sizeof(float4));
+    float4* hostDataFloat4Ground = new float4[floatCount];
+    NR_CUDA_SAFE_CALL(cudaMemcpy(hostDataFloat4Ground, *positionFieldImageArray_d, memoryReq, cudaMemcpyDeviceToHost))
+
+    /************************ test accuracy *****************************/
+    double4_t * positionFieldImageArrayDouble_h = (double4_t *)calloc(
+            referenceImageDimCPU.x*referenceImageDimCPU.y*referenceImageDimCPU.z , sizeof(double4_t));
+    reg_bspline_getDeformationFieldLerpCPU2_doubleOUT(controlPointImageArray_h, positionFieldImageArrayDouble_h,
+            controlPointImageDimCPU, referenceImageDimCPU, controlPointVoxelSpacingCPU);
+
+    /************************ run the tests *****************************/
+
+    int errors = 0;
+    double3_t average_error = make_double3_t(0.0, 0.0, 0.0);
+    int count_x = 0,count_y = 0,count_z = 0;
+    float e = 1.f;
+    for (int i = 0; i < activeVoxelNumber; ++i) {
+        average_error.x = average_error.x + fabs( (double)hostDataFloat4[i].x - positionFieldImageArrayDouble_h[i].x );
+        average_error.y = average_error.y + fabs( (double)hostDataFloat4[i].y - positionFieldImageArrayDouble_h[i].y );
+        average_error.z = average_error.z + fabs( (double)hostDataFloat4[i].z - positionFieldImageArrayDouble_h[i].z );
+
+        errors += fabs( hostDataFloat4[i].x - hostDataFloat4Ground[i].x ) > e;
+        errors += fabs( hostDataFloat4[i].y - hostDataFloat4Ground[i].y ) > e;
+        errors += fabs( hostDataFloat4[i].z - hostDataFloat4Ground[i].z ) > e;
+        errors += fabs( hostDataFloat4[i].w - hostDataFloat4Ground[i].w ) > e;
+        if (fabs( hostDataFloat4[i].x - hostDataFloat4Ground[i].x ) > e){
+            count_x++;
+        }
+        if (fabs( hostDataFloat4[i].y - hostDataFloat4Ground[i].y ) > e){
+            count_y++;
+        }
+        if (fabs( hostDataFloat4[i].z - hostDataFloat4Ground[i].z ) > e){
+            count_z++;
+        }
+    }
+    average_error = average_error / activeVoxelNumber;
+    double average_xyz = (average_error.x + average_error.y + average_error.z) / 3;
+
+    fprintf(f, "%.10f,%d,%d,%d,%d\n", average_xyz, errors, controlPointVoxelSpacingInt.x, controlPointVoxelSpacingInt.y, controlPointVoxelSpacingInt.z);
+
+    printf("**** Average error in x: %f, y: %f, z: %f\n", average_error.x, average_error.y, average_error.z);
+    printf("**** Number of errors in x: %d, y: %d, z: %d\n", count_x, count_y, count_z);
+    printf("**** Number of misalignment errors: %d\n", errors);
+
+    fclose(f);
+
+    NR_CUDA_SAFE_CALL(cudaUnbindTexture(controlPointTexture))
+    NR_CUDA_SAFE_CALL(cudaUnbindTexture(maskTexture))
+
+    NR_CUDA_SAFE_CALL(cudaFreeArray(controlPoints3D))
+    delete[] hostDataFloat4;
+    delete[] hostDataFloat4Ground;
+    delete[] controlTemp;
+    free(controlPointImageArray_h);
+    free(positionFieldImageArray_h);
+    free(positionFieldImageArrayDouble_h);
+#if ID > 0
+    delete[] mem_test;
+    NR_CUDA_SAFE_CALL(cudaFreeArray(input3D))
+    NR_CUDA_SAFE_CALL(cudaFree(preheat))
+    NR_CUDA_SAFE_CALL(cudaFreeHost(mem_test_d))
+#endif
+
+    return;
+}
+/* *************************************************************** */
+/* **************** Here we compare the performance of our approach in registration ***************** */
+void reg_bspline_test_reg(nifti_image *controlPointImage,
+                     nifti_image *reference,
+                     float4 **controlPointImageArray_d,
+                     float4 **positionFieldImageArray_d,
+                     int **mask_d,
+                     int activeVoxelNumber,
+                     bool bspline)
+{
+
+#define IDR 2 //findtoo, valid values = 1,2: 1 original, 2 accelerated - check also reg_apps/reg_f3d.cpp if necessary
+
+#if IDR == 1
+    const int useBSpline = bspline;
+#endif
+
+    const int voxelNumber = reference->nx * reference->ny * reference->nz;
+    const int3 referenceImageDim = make_int3(reference->nx, reference->ny, reference->nz);
+    const int3 controlPointImageDim = make_int3(controlPointImage->nx, controlPointImage->ny, controlPointImage->nz);
+
+    const int controlPointNumber = controlPointImage->nx*controlPointImage->ny*controlPointImage->nz;
+
+    const float3 controlPointVoxelSpacing = make_float3(
+        controlPointImage->dx / reference->dx,
+        controlPointImage->dy / reference->dy,
+        controlPointImage->dz / reference->dz);
+
+#if IDR == 2
+    const int3 controlPointVoxelSpacingInt = make_int3(
+        lrintf( controlPointImage->dx / reference->dx ),
+        lrintf( controlPointImage->dy / reference->dy ),
+        lrintf( controlPointImage->dz / reference->dz ));
+#endif
+
+#if IDR == 1
+    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_UseBSpline,&useBSpline,sizeof(int)))//
+    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_ControlPointVoxelSpacing,&controlPointVoxelSpacing,sizeof(float3)))//
+    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_ActiveVoxelNumber,&activeVoxelNumber,sizeof(int)))//
+#endif
+    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_ControlPointImageDim,&controlPointImageDim,sizeof(int3)))//
+    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_ReferenceImageDim,&referenceImageDim,sizeof(int3)))//
+    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_VoxelNumber,&voxelNumber,sizeof(int)))
+
+#if IDR == 2
+    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_controlPointVoxelSpacingInt,&controlPointVoxelSpacingInt,sizeof(float3)))
+#endif
+
+    NR_CUDA_SAFE_CALL(cudaBindTexture(0, controlPointTexture, *controlPointImageArray_d, controlPointNumber*sizeof(float4)))
+
+#if IDR == 2
+    const int3 tilesDim = make_int3(ceilf((float)reference->nx / (float)controlPointVoxelSpacing.x),
+                                    ceilf((float)reference->ny / (float)controlPointVoxelSpacing.y),
+                                    ceilf((float)reference->nz / (float)controlPointVoxelSpacing.z));
+    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_tilesDim,&tilesDim,sizeof(int3)))
+
+    float x_g0[MAX_CURRENT_SPACE];
+    float y_g0[MAX_CURRENT_SPACE];
+    float z_g0[MAX_CURRENT_SPACE];
+    float x_h0_r[MAX_CURRENT_SPACE];
+    float x_h1_r[MAX_CURRENT_SPACE];
+    float y_h0_r[MAX_CURRENT_SPACE];
+    float y_h1_r[MAX_CURRENT_SPACE];
+    float z_h0_r[MAX_CURRENT_SPACE];
+    float z_h1_r[MAX_CURRENT_SPACE];
+    float xBasis[NUM_C*MAX_CURRENT_SPACE];
+    float yBasis[NUM_C*MAX_CURRENT_SPACE];
+    float zBasis[NUM_C*MAX_CURRENT_SPACE];
+    float relative;
+    for (int i = 0; i < controlPointVoxelSpacingInt.x; ++i) {
+        relative = (float) i / controlPointVoxelSpacing.x;
+        float FF= relative*relative;
+        float FFF= FF*relative;
+        float MF=1.f-relative;
+        xBasis[0+NUM_C*i] = (MF)*(MF)*(MF)/(6.f);
+        xBasis[1+NUM_C*i] = (3.f*FFF - 6.f*FF + 4.f)/6.f;
+        xBasis[2+NUM_C*i] = (-3.f*FFF + 3.f*FF + 3.f*relative + 1.f)/6.f;
+        xBasis[3+NUM_C*i] = (FFF/6.f);
+
+        x_g0[i] = xBasis[0+NUM_C*i] + xBasis[1+NUM_C*i];
+
+        x_h0_r[i] = xBasis[1+NUM_C*i] / (x_g0[i]);
+        x_h1_r[i] = xBasis[3+NUM_C*i] / (1 - x_g0[i]);
+
+    }
+    for (int i = 0; i < controlPointVoxelSpacingInt.y; ++i) {
+        relative = (float) i / controlPointVoxelSpacing.y;
+        float FF= relative*relative;
+        float FFF= FF*relative;
+        float MF=1.f-relative;
+        yBasis[0+NUM_C*i] = (MF)*(MF)*(MF)/(6.f);
+        yBasis[1+NUM_C*i] = (3.f*FFF - 6.f*FF + 4.f)/6.f;
+        yBasis[2+NUM_C*i] = (-3.f*FFF + 3.f*FF + 3.f*relative + 1.f)/6.f;
+        yBasis[3+NUM_C*i] = (FFF/6.f);
+
+        y_g0[i] = yBasis[0+NUM_C*i] + yBasis[1+NUM_C*i];
+
+        y_h0_r[i] = yBasis[1+NUM_C*i] / (y_g0[i]);
+        y_h1_r[i] = yBasis[3+NUM_C*i] / (1 - y_g0[i]);
+    }
+    for (int i = 0; i < controlPointVoxelSpacingInt.z; ++i) {
+        relative = (float) i / controlPointVoxelSpacing.z;
+        float FF= relative*relative;
+        float FFF= FF*relative;
+        float MF=1.f-relative;
+        zBasis[0+NUM_C*i] = (MF)*(MF)*(MF)/(6.f);
+        zBasis[1+NUM_C*i] = (3.f*FFF - 6.f*FF + 4.f)/6.f;
+        zBasis[2+NUM_C*i] = (-3.f*FFF + 3.f*FF + 3.f*relative + 1.f)/6.f;
+        zBasis[3+NUM_C*i] = (FFF/6.f);
+
+        z_g0[i] = zBasis[0+NUM_C*i] + zBasis[1+NUM_C*i];
+
+        z_h0_r[i] = zBasis[1+NUM_C*i] / (z_g0[i]);
+        z_h1_r[i] = zBasis[3+NUM_C*i] / (1 - z_g0[i]);
+    }
+
+    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_x_g0,&x_g0,MAX_CURRENT_SPACE*sizeof(float)))
+    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_y_g0,&y_g0,MAX_CURRENT_SPACE*sizeof(float)))
+    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_z_g0,&z_g0,MAX_CURRENT_SPACE*sizeof(float)))
+
+    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_x_h0_r,&x_h0_r,MAX_CURRENT_SPACE*sizeof(float)))
+    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_x_h1_r,&x_h1_r,MAX_CURRENT_SPACE*sizeof(float)))
+    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_y_h0_r,&y_h0_r,MAX_CURRENT_SPACE*sizeof(float)))
+    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_y_h1_r,&y_h1_r,MAX_CURRENT_SPACE*sizeof(float)))
+    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_z_h0_r,&z_h0_r,MAX_CURRENT_SPACE*sizeof(float)))
+    NR_CUDA_SAFE_CALL(cudaMemcpyToSymbol(c_z_h1_r,&z_h1_r,MAX_CURRENT_SPACE*sizeof(float)))
+
+    dim3 B2(BLOCK_BS_X,BLOCK_BS_Y,BLOCK_BS_Z);
+    dim3 G2((unsigned int) ceilf((float)(tilesDim.x) / B2.x),
+            (unsigned int) ceilf((float)(tilesDim.y) / B2.y),
+            (unsigned int) ceilf((float)(tilesDim.z) / B2.z));
+#endif
+
+#if IDR == 1
+    const unsigned int Grid_reg_bspline_getDeformationField0 =
+        (unsigned int)ceilf(sqrtf((float)activeVoxelNumber/(float)(Block_reg_bspline_getDeformationField)));
+    dim3 G0(Grid_reg_bspline_getDeformationField0,Grid_reg_bspline_getDeformationField0,1);
+    dim3 B0(256,1,1);
+#endif
+
+#if IDR == 1
+    reg_bspline_getDeformationField0_noMask<<< G0, B0 >>>(*positionFieldImageArray_d);
+#endif
+#if IDR == 2
+    reg_bspline_getDeformationFieldTileLerp3_noSh<<<G2, B2 >>>(*positionFieldImageArray_d, *controlPointImageArray_d);
+#endif
+
+    cudaThreadSynchronize();
+    cudaError err = cudaPeekAtLastError();
+    if( err != cudaSuccess) {
+        fprintf(stderr, "[NiftyReg CUDA ERROR] file _reg_localTransformation_gpu.cu : %s.\n",
+        cudaGetErrorString(err));
+        exit(1);
+    }
+
+    NR_CUDA_SAFE_CALL(cudaUnbindTexture(controlPointTexture))
+
     return;
 }
 /* *************************************************************** */

@@ -1217,6 +1217,1249 @@ void reg_spline_getDeformationField3D(nifti_image *splineControlPoint,
     return;
 }
 /* *************************************************************** */
+/* ************************* Bare original ************************** */
+void reg_spline_getDeformationField3D2(nifti_image *splineControlPoint,
+                                      nifti_image *referenceImage,
+                                      nifti_image *deformationField
+                                      )
+{
+    union{
+        __m128 m;
+        float f[4];
+    } val;
+    __m128 tempX, tempY, tempZ, tempCurrent;
+    __m128 xBasis_sse, yBasis_sse, zBasis_sse, temp_basis_sse, basis_sse;
+
+    float temp[4] __attribute__((aligned(16)));
+    float zBasis[4] __attribute__((aligned(16)));
+    union{__m128 m[16];float f[16] __attribute__((aligned(16)));} xControlPointCoordinates;
+    union{__m128 m[16];float f[16] __attribute__((aligned(16)));} yControlPointCoordinates;
+    union{__m128 m[16];float f[16] __attribute__((aligned(16)));} zControlPointCoordinates;
+
+    float *controlPointPtrX = static_cast<float *>(splineControlPoint->data);
+    float *controlPointPtrY = &controlPointPtrX[splineControlPoint->nx*splineControlPoint->ny*splineControlPoint->nz];
+    float *controlPointPtrZ = &controlPointPtrY[splineControlPoint->nx*splineControlPoint->ny*splineControlPoint->nz];
+
+    float *fieldPtrX=static_cast<float *>(deformationField->data);
+    float *fieldPtrY=&fieldPtrX[deformationField->nx*deformationField->ny*deformationField->nz];
+    float *fieldPtrZ=&fieldPtrY[deformationField->nx*deformationField->ny*deformationField->nz];
+
+    float gridVoxelSpacing[3];
+    gridVoxelSpacing[0] = splineControlPoint->dx / referenceImage->dx;
+    gridVoxelSpacing[1] = splineControlPoint->dy / referenceImage->dy;
+    gridVoxelSpacing[2] = splineControlPoint->dz / referenceImage->dz;
+
+    float basis, oldBasis=(float)(1.1);
+
+    int x, y, z, a, b, c, oldPreX, oldPreY, oldPreZ, xPre, yPre, zPre, index;
+    float real[3];
+
+    union u1{__m128 m[4];float f[16] __attribute__((aligned(16)));}yzBasis;
+    union u2{__m128 m[16];float f[64] __attribute__((aligned(16)));}xyzBasis;
+
+#ifdef _OPENMP
+#pragma omp parallel for default(none) \
+    private(x, y, z, a, b, c, oldPreX, oldPreY, oldPreZ, xPre, yPre, zPre, real, \
+    index, basis, xyzBasis, yzBasis, zBasis, temp, xControlPointCoordinates, \
+    yControlPointCoordinates, zControlPointCoordinates, oldBasis, \
+    tempX, tempY, tempZ, xBasis_sse, yBasis_sse, zBasis_sse, \
+    temp_basis_sse, basis_sse, val, tempCurrent) \
+    shared(deformationField, fieldPtrX, fieldPtrY, fieldPtrZ, splineControlPoint, \
+    gridVoxelSpacing, controlPointPtrX, controlPointPtrY, controlPointPtrZ)
+#endif // _OPENMP
+    for(z=0; z<deformationField->nz; z++){
+
+        index=z*deformationField->nx*deformationField->ny;
+        oldBasis=1.1;
+
+        zPre=(int)((float)z/gridVoxelSpacing[2]);
+        basis=(float)z/gridVoxelSpacing[2]-(float)zPre;
+        if(basis<0.0) basis=0.0; //rounding error
+        Get_BSplineBasisValues<float>(basis, zBasis);
+
+        for(y=0; y<deformationField->ny; y++){
+
+            yPre=(int)((float)y/gridVoxelSpacing[1]);
+            basis=(float)y/gridVoxelSpacing[1]-(float)yPre;
+            if(basis<0.0) basis=0.0; //rounding error
+            Get_BSplineBasisValues<float>(basis, temp);
+
+            val.f[0] = temp[0];
+            val.f[1] = temp[1];
+            val.f[2] = temp[2];
+            val.f[3] = temp[3];
+            tempCurrent=val.m;
+            for(a=0;a<4;a++){
+                val.m=_mm_set_ps1(zBasis[a]);
+                yzBasis.m[a] = _mm_mul_ps(tempCurrent,val.m);
+            }
+
+            for(x=0; x<deformationField->nx; x++){
+
+                xPre=(int)((float)x/gridVoxelSpacing[0]);
+                basis=(float)x/gridVoxelSpacing[0]-(float)xPre;
+                if(basis<0.0) basis=0.0; //rounding error
+                Get_BSplineBasisValues<float>(basis, temp);
+
+                val.f[0] = temp[0];
+                val.f[1] = temp[1];
+                val.f[2] = temp[2];
+                val.f[3] = temp[3];
+                tempCurrent=val.m;
+                for(a=0;a<16;++a){
+                    val.m=_mm_set_ps1(yzBasis.f[a]);
+                    xyzBasis.m[a]=_mm_mul_ps(tempCurrent,val.m);
+                }
+                if(basis<=oldBasis || x==0){
+                    get_GridValues<float>(xPre,
+                                          yPre,
+                                          zPre,
+                                          splineControlPoint,
+                                          controlPointPtrX,
+                                          controlPointPtrY,
+                                          controlPointPtrZ,
+                                          xControlPointCoordinates.f,
+                                          yControlPointCoordinates.f,
+                                          zControlPointCoordinates.f,
+                                          false);
+                }
+                oldBasis=basis;
+
+                real[0]=0.0;
+                real[1]=0.0;
+                real[2]=0.0;
+
+                tempX =  _mm_set_ps1(0.0);
+                tempY =  _mm_set_ps1(0.0);
+                tempZ =  _mm_set_ps1(0.0);
+                //addition and multiplication of the 64 basis value and CP displacement for each axis
+                for(a=0; a<16; a++){
+                    tempX = _mm_add_ps(_mm_mul_ps(xyzBasis.m[a], xControlPointCoordinates.m[a]), tempX );
+                    tempY = _mm_add_ps(_mm_mul_ps(xyzBasis.m[a], yControlPointCoordinates.m[a]), tempY );
+                    tempZ = _mm_add_ps(_mm_mul_ps(xyzBasis.m[a], zControlPointCoordinates.m[a]), tempZ );
+                }
+                //the values stored in SSE variables are transfered to normal float
+                val.m=tempX;
+                real[0]=val.f[0]+val.f[1]+val.f[2]+val.f[3];
+                val.m=tempY;
+                real[1]= val.f[0]+val.f[1]+val.f[2]+val.f[3];
+                val.m=tempZ;
+                real[2]= val.f[0]+val.f[1]+val.f[2]+val.f[3];
+
+                fieldPtrX[index] = (float)real[0];
+                fieldPtrY[index] = (float)real[1];
+                fieldPtrZ[index] = (float)real[2];
+                index++;
+            } // x
+        } // y
+    } // z
+
+    return;
+}
+/* *************************************************************** */
+void create_weights_cpu(float3_t fraction, float3_t& w0, float3_t& w1, float3_t& w2, float3_t& w3)
+{
+    const float3_t one_frac = 1.0f - fraction;
+    const float3_t squared = fraction * fraction;
+    const float3_t one_sqd = one_frac * one_frac;
+
+    w0 = 1.0f/6.0f * one_sqd * one_frac;
+    w1 = 2.0f/3.0f - 0.5f * squared * (2.0f-fraction);
+    w2 = 2.0f/3.0f - 0.5f * one_sqd * (2.0f-one_frac);
+    w3 = 1.0f/6.0f * squared * fraction;
+}
+void create_weights_cpu_double(double3_t fraction, double3_t& w0, double3_t& w1, double3_t& w2, double3_t& w3)
+{
+    const double3_t one_frac = 1.0 - fraction;
+    const double3_t squared = fraction * fraction;
+    const double3_t one_sqd = one_frac * one_frac;
+
+    w0 = 1.0/6.0 * one_sqd * one_frac;
+    w1 = 2.0/3.0 - 0.5 * squared * (2.0-fraction);
+    w2 = 2.0/3.0 - 0.5 * one_sqd * (2.0-one_frac);
+    w3 = 1.0/6.0 * squared * fraction;
+}
+
+static float x_g0[MAX_CURRENT_SPACE];
+static float y_g0[MAX_CURRENT_SPACE];
+static float z_g0[MAX_CURRENT_SPACE];
+static float x_h0_r[MAX_CURRENT_SPACE];
+static float x_h1_r[MAX_CURRENT_SPACE];
+static float y_h0_r[MAX_CURRENT_SPACE];
+static float y_h1_r[MAX_CURRENT_SPACE];
+static float z_h0_r[MAX_CURRENT_SPACE];
+static float z_h1_r[MAX_CURRENT_SPACE];
+static float xBasis[NUM_C*MAX_CURRENT_SPACE];
+static float yBasis[NUM_C*MAX_CURRENT_SPACE];
+static float zBasis[NUM_C*MAX_CURRENT_SPACE];
+static float relative;
+
+void create_weights_LUT(float3_t controlPointVoxelSpacing, int3_t controlPointVoxelSpacing_i)
+{
+    for (int i = 0; i < controlPointVoxelSpacing_i.x; ++i) {
+        relative = (float) i / controlPointVoxelSpacing.x;
+        float FF= relative*relative;
+        float FFF= FF*relative;
+        float MF=1.f-relative;
+        xBasis[0+NUM_C*i] = (MF)*(MF)*(MF)/(6.f);
+        xBasis[1+NUM_C*i] = (3.f*FFF - 6.f*FF + 4.f)/6.f;
+        xBasis[2+NUM_C*i] = (-3.f*FFF + 3.f*FF + 3.f*relative + 1.f)/6.f;
+        xBasis[3+NUM_C*i] = (FFF/6.f);
+
+        x_g0[i] = xBasis[0+NUM_C*i] + xBasis[1+NUM_C*i];
+
+        x_h0_r[i] = xBasis[1+NUM_C*i] / (x_g0[i]);
+        x_h1_r[i] = xBasis[3+NUM_C*i] / (1 - x_g0[i]);
+    }
+    for (int i = 0; i < controlPointVoxelSpacing_i.y; ++i) {
+        relative = (float) i / controlPointVoxelSpacing.y;
+        float FF= relative*relative;
+        float FFF= FF*relative;
+        float MF=1.f-relative;
+        yBasis[0+NUM_C*i] = (MF)*(MF)*(MF)/(6.f);
+        yBasis[1+NUM_C*i] = (3.f*FFF - 6.f*FF + 4.f)/6.f;
+        yBasis[2+NUM_C*i] = (-3.f*FFF + 3.f*FF + 3.f*relative + 1.f)/6.f;
+        yBasis[3+NUM_C*i] = (FFF/6.f);
+
+        y_g0[i] = yBasis[0+NUM_C*i] + yBasis[1+NUM_C*i];
+
+        y_h0_r[i] = yBasis[1+NUM_C*i] / (y_g0[i]);
+        y_h1_r[i] = yBasis[3+NUM_C*i] / (1 - y_g0[i]);
+    }
+    for (int i = 0; i < controlPointVoxelSpacing_i.z; ++i) {
+        relative = (float) i / controlPointVoxelSpacing.z;
+        float FF= relative*relative;
+        float FFF= FF*relative;
+        float MF=1.f-relative;
+        zBasis[0+NUM_C*i] = (MF)*(MF)*(MF)/(6.f);
+        zBasis[1+NUM_C*i] = (3.f*FFF - 6.f*FF + 4.f)/6.f;
+        zBasis[2+NUM_C*i] = (-3.f*FFF + 3.f*FF + 3.f*relative + 1.f)/6.f;
+        zBasis[3+NUM_C*i] = (FFF/6.f);
+
+        z_g0[i] = zBasis[0+NUM_C*i] + zBasis[1+NUM_C*i];
+
+        z_h0_r[i] = zBasis[1+NUM_C*i] / (z_g0[i]);
+        z_h1_r[i] = zBasis[3+NUM_C*i] / (1 - z_g0[i]);
+    }
+}
+
+/* *************************************************************** */
+/* ******* Double precision implementation (Fused Multiply Accumulate) that is used for accuracy comparison ******** */
+void reg_spline_getDeformationField3D3_double(nifti_image *splineControlPoint, nifti_image *referenceImage,
+        nifti_image *deformationField)
+{
+    double3_t gridVoxelSpacing;
+    gridVoxelSpacing.x = (double)splineControlPoint->dx / (double)referenceImage->dx;
+    gridVoxelSpacing.y = (double)splineControlPoint->dy / (double)referenceImage->dy;
+    gridVoxelSpacing.z = (double)splineControlPoint->dz / (double)referenceImage->dz;
+
+    const int3_t referenceImageDim = {referenceImage->nx, referenceImage->ny, referenceImage->nz};
+    const int3_t controlPointImageDim = {splineControlPoint->nx, splineControlPoint->ny, splineControlPoint->nz};
+
+    for (int z = 0; z < referenceImageDim.z; ++z) {
+        for (int y = 0; y < referenceImageDim.y; ++y) {
+            for (int x = 0; x < referenceImageDim.x; ++x) {
+
+                // the "nearest previous" node is determined [0,0,0]
+                double3_t nodeAnte;
+                nodeAnte.x = floorf((double)x/gridVoxelSpacing.x);
+                nodeAnte.y = floorf((double)y/gridVoxelSpacing.y);
+                nodeAnte.z = floorf((double)z/gridVoxelSpacing.z);
+
+                double3_t relative;
+                relative.z = fabsf((double)z/gridVoxelSpacing.z-nodeAnte.z);
+                relative.y = fabsf((double)y/gridVoxelSpacing.y-nodeAnte.y);
+                relative.x = fabsf((double)x/gridVoxelSpacing.x-nodeAnte.x);
+
+                double3_t w0, w1, w2, w3;
+                create_weights_cpu_double(relative, w0, w1, w2, w3);
+
+                const double3_t g0 = w0 + w1;
+                const double3_t g1 = w2 + w3;
+                const double3_t h0 = (w1 / g0);
+                const double3_t h1 = (w3 / g1);
+
+                double *controlPointPtr = static_cast<double *>(splineControlPoint->data);
+                double *fieldPtr = static_cast<double *>(deformationField->data);
+
+                for (int coord = 0; coord < 3; ++coord) {
+
+                    double nodeCoefficientA[NUM_C*NUM_C], nodeCoefficientB[NUM_C*NUM_C], nodeCoefficientC[NUM_C*NUM_C], nodeCoefficientD[NUM_C*NUM_C];
+
+                    for(int c=0; c<NUM_C; c++){
+                        int indexYZ= ( (nodeAnte.z + c) * controlPointImageDim.y + nodeAnte.y) * controlPointImageDim.x;
+                        for(int b=0; b<NUM_C; b++){
+
+                            int indexXYZ = indexYZ + nodeAnte.x;
+
+                            nodeCoefficientA[b + NUM_C*c] = controlPointPtr[indexXYZ++];
+                            nodeCoefficientB[b + NUM_C*c] = controlPointPtr[indexXYZ++];
+                            nodeCoefficientC[b + NUM_C*c] = controlPointPtr[indexXYZ++];
+                            nodeCoefficientD[b + NUM_C*c] = controlPointPtr[indexXYZ];
+
+                            indexYZ += controlPointImageDim.x;
+                        }
+                    }
+
+                    double c000_,c001_,c010_,c011_,c100_,c101_,c110_,c111_;
+
+                    c000_ = nodeCoefficientA[0*NUM_C];
+                    c001_ = nodeCoefficientA[0*NUM_C+NUM_C];
+                    c010_ = nodeCoefficientA[0*NUM_C+1];
+                    c011_ = nodeCoefficientA[0*NUM_C+NUM_C+1];
+                    c100_ = nodeCoefficientB[0*NUM_C];
+                    c101_ = nodeCoefficientB[0*NUM_C+NUM_C];
+                    c110_ = nodeCoefficientB[0*NUM_C+1];
+                    c111_ = nodeCoefficientB[0*NUM_C+NUM_C+1];
+
+                    c000_ = c000_ + h0.z*(c001_-c000_);
+                    c010_ = c010_ + h0.z*(c011_-c010_);
+                    c100_ = c100_ + h0.z*(c101_-c100_);
+                    c110_ = c110_ + h0.z*(c111_-c110_);
+
+                    c000_ = c000_ + h0.y*(c010_-c000_);
+                    c100_ = c100_ + h0.y*(c110_-c100_);
+
+                    double c000;
+                    c000 =  c000_ + h0.x*(c100_-c000_);
+
+                    c000_ = nodeCoefficientA[2*NUM_C];
+                    c001_ = nodeCoefficientA[2*NUM_C+NUM_C];
+                    c010_ = nodeCoefficientA[2*NUM_C+1];
+                    c011_ = nodeCoefficientA[2*NUM_C+NUM_C+1];
+                    c100_ = nodeCoefficientB[2*NUM_C];
+                    c101_ = nodeCoefficientB[2*NUM_C+NUM_C];
+                    c110_ = nodeCoefficientB[2*NUM_C+1];
+                    c111_ = nodeCoefficientB[2*NUM_C+NUM_C+1];
+
+                    c000_ = c000_ + h1.z*(c001_-c000_);
+                    c010_ = c010_ + h1.z*(c011_-c010_);
+                    c100_ = c100_ + h1.z*(c101_-c100_);
+                    c110_ = c110_ + h1.z*(c111_-c110_);
+
+                    c000_ = c000_ + h0.y*(c010_-c000_);
+                    c100_ = c100_ + h0.y*(c110_-c100_);
+
+                    double c001;
+                    c001 =  c000_ + h0.x*(c100_-c000_);
+
+                    c000_ = nodeCoefficientA[0*NUM_C+2];
+                    c001_ = nodeCoefficientA[0*NUM_C+NUM_C+2];
+                    c010_ = nodeCoefficientA[0*NUM_C+1+2];
+                    c011_ = nodeCoefficientA[0*NUM_C+NUM_C+1+2];
+                    c100_ = nodeCoefficientB[0*NUM_C+2];
+                    c101_ = nodeCoefficientB[0*NUM_C+NUM_C+2];
+                    c110_ = nodeCoefficientB[0*NUM_C+1+2];
+                    c111_ = nodeCoefficientB[0*NUM_C+NUM_C+1+2];
+
+                    c000_ = c000_ + h0.z*(c001_-c000_);
+                    c010_ = c010_ + h0.z*(c011_-c010_);
+                    c100_ = c100_ + h0.z*(c101_-c100_);
+                    c110_ = c110_ + h0.z*(c111_-c110_);
+
+                    c000_ = c000_ + h1.y*(c010_-c000_);
+                    c100_ = c100_ + h1.y*(c110_-c100_);
+
+                    double c010;
+                    c010 =  c000_ + h0.x*(c100_-c000_);
+
+                    c000_ = nodeCoefficientA[2*NUM_C+2];
+                    c001_ = nodeCoefficientA[2*NUM_C+NUM_C+2];
+                    c010_ = nodeCoefficientA[2*NUM_C+1+2];
+                    c011_ = nodeCoefficientA[2*NUM_C+NUM_C+1+2];
+                    c100_ = nodeCoefficientB[2*NUM_C+2];
+                    c101_ = nodeCoefficientB[2*NUM_C+NUM_C+2];
+                    c110_ = nodeCoefficientB[2*NUM_C+1+2];
+                    c111_ = nodeCoefficientB[2*NUM_C+NUM_C+1+2];
+
+                    c000_ = c000_ + h1.z*(c001_-c000_);
+                    c010_ = c010_ + h1.z*(c011_-c010_);
+                    c100_ = c100_ + h1.z*(c101_-c100_);
+                    c110_ = c110_ + h1.z*(c111_-c110_);
+
+                    c000_ = c000_ + h1.y*(c010_-c000_);
+                    c100_ = c100_ + h1.y*(c110_-c100_);
+
+                    double c011;
+                    c011 =  c000_ + h0.x*(c100_-c000_);
+
+                    c000_ = nodeCoefficientC[0*NUM_C];
+                    c001_ = nodeCoefficientC[0*NUM_C+NUM_C];
+                    c010_ = nodeCoefficientC[0*NUM_C+1];
+                    c011_ = nodeCoefficientC[0*NUM_C+NUM_C+1];
+                    c100_ = nodeCoefficientD[0*NUM_C];
+                    c101_ = nodeCoefficientD[0*NUM_C+NUM_C];
+                    c110_ = nodeCoefficientD[0*NUM_C+1];
+                    c111_ = nodeCoefficientD[0*NUM_C+NUM_C+1];
+
+                    c000_ = c000_ + h0.z*(c001_-c000_);
+                    c010_ = c010_ + h0.z*(c011_-c010_);
+                    c100_ = c100_ + h0.z*(c101_-c100_);
+                    c110_ = c110_ + h0.z*(c111_-c110_);
+
+                    c000_ = c000_ + h0.y*(c010_-c000_);
+                    c100_ = c100_ + h0.y*(c110_-c100_);
+
+                    double c100;
+                    c100 =  c000_ + h1.x*(c100_-c000_);
+
+                    c000_ = nodeCoefficientC[2*NUM_C];
+                    c001_ = nodeCoefficientC[2*NUM_C+NUM_C];
+                    c010_ = nodeCoefficientC[2*NUM_C+1];
+                    c011_ = nodeCoefficientC[2*NUM_C+NUM_C+1];
+                    c100_ = nodeCoefficientD[2*NUM_C];
+                    c101_ = nodeCoefficientD[2*NUM_C+NUM_C];
+                    c110_ = nodeCoefficientD[2*NUM_C+1];
+                    c111_ = nodeCoefficientD[2*NUM_C+NUM_C+1];
+
+                    c000_ = c000_ + h1.z*(c001_-c000_);
+                    c010_ = c010_ + h1.z*(c011_-c010_);
+                    c100_ = c100_ + h1.z*(c101_-c100_);
+                    c110_ = c110_ + h1.z*(c111_-c110_);
+
+                    c000_ = c000_ + h0.y*(c010_-c000_);
+                    c100_ = c100_ + h0.y*(c110_-c100_);
+
+                    double c101;
+                    c101 =  c000_ + h1.x*(c100_-c000_);
+
+                    c000_ = nodeCoefficientC[0*NUM_C+2];
+                    c001_ = nodeCoefficientC[0*NUM_C+NUM_C+2];
+                    c010_ = nodeCoefficientC[0*NUM_C+1+2];
+                    c011_ = nodeCoefficientC[0*NUM_C+NUM_C+1+2];
+                    c100_ = nodeCoefficientD[0*NUM_C+2];
+                    c101_ = nodeCoefficientD[0*NUM_C+NUM_C+2];
+                    c110_ = nodeCoefficientD[0*NUM_C+1+2];
+                    c111_ = nodeCoefficientD[0*NUM_C+NUM_C+1+2];
+
+                    c000_ = c000_ + h0.z*(c001_-c000_);
+                    c010_ = c010_ + h0.z*(c011_-c010_);
+                    c100_ = c100_ + h0.z*(c101_-c100_);
+                    c110_ = c110_ + h0.z*(c111_-c110_);
+
+                    c000_ = c000_ + h1.y*(c010_-c000_);
+                    c100_ = c100_ + h1.y*(c110_-c100_);
+
+                    double c110;
+                    c110 =  c000_ + h1.x*(c100_-c000_);
+
+                    c000_ = nodeCoefficientC[2*NUM_C+2];
+                    c001_ = nodeCoefficientC[2*NUM_C+NUM_C+2];
+                    c010_ = nodeCoefficientC[2*NUM_C+1+2];
+                    c011_ = nodeCoefficientC[2*NUM_C+NUM_C+1+2];
+                    c100_ = nodeCoefficientD[2*NUM_C+2];
+                    c101_ = nodeCoefficientD[2*NUM_C+NUM_C+2];
+                    c110_ = nodeCoefficientD[2*NUM_C+1+2];
+                    c111_ = nodeCoefficientD[2*NUM_C+NUM_C+1+2];
+
+                    c000_ = c000_ + h1.z*(c001_-c000_);
+                    c010_ = c010_ + h1.z*(c011_-c010_);
+                    c100_ = c100_ + h1.z*(c101_-c100_);
+                    c110_ = c110_ + h1.z*(c111_-c110_);
+
+                    c000_ = c000_ + h1.y*(c010_-c000_);
+                    c100_ = c100_ + h1.y*(c110_-c100_);
+
+                    double c111;
+                    c111 =  c000_ + h1.x*(c100_-c000_);
+
+
+                    c000 = c001 + g0.z*(c000-c001);
+                    c010 = c011 + g0.z*(c010-c011);
+                    c100 = c101 + g0.z*(c100-c101);
+                    c110 = c111 + g0.z*(c110-c111);
+
+                    c000 = c010 + g0.y*(c000-c010);
+                    c100 = c110 + g0.y*(c100-c110);
+
+                    c000 = c100 + g0.x*(c000-c100);
+
+                    int tmp_index = z * referenceImageDim.y * referenceImageDim.x + y * referenceImageDim.x + x;
+
+                    fieldPtr[tmp_index] = c000;
+
+                    controlPointPtr = &controlPointPtr[splineControlPoint->nx*splineControlPoint->ny*splineControlPoint->nz];
+                    fieldPtr = &fieldPtr[deformationField->nx*deformationField->ny*deformationField->nz];
+                } // coord
+
+            } // x
+        } // y
+    } // z
+
+    return;
+}
+/* *************************************************************** */
+/* ******************** Vector per Tile ************************ */
+/* *************** !!! Careful: gridVoxelSpacing.x up to 16 voxels !!! ******************* */
+void reg_spline_getDeformationField3D7omp16(nifti_image *splineControlPoint, nifti_image *referenceImage,
+        nifti_image *deformationField, const int3_t gridVoxelSpacing, const int3_t tilesDim)
+{
+    const int3_t referenceImageDim = {referenceImage->nx, referenceImage->ny, referenceImage->nz};
+    const int3_t controlPointImageDim = {splineControlPoint->nx, splineControlPoint->ny, splineControlPoint->nz};
+
+#pragma omp parallel num_threads(NUM_THREADS)
+{
+#pragma omp for nowait
+
+    for (int z = 0; z < tilesDim.z; ++z) {
+        for (int y = 0; y < tilesDim.y; ++y) {
+            for (int x = 0; x < tilesDim.x; ++x) {
+
+                float *controlPointPtr = static_cast<float *>(splineControlPoint->data);
+                float *fieldPtr = static_cast<float *>(deformationField->data);
+
+                float displacement[VECTOR_ELEM] __attribute__((aligned(32)));
+
+                float displacementA[VECTOR_ELEM] __attribute__((aligned(32)));
+                float displacementB[VECTOR_ELEM] __attribute__((aligned(32)));
+
+                for (int coord = 0; coord < 3; ++coord) {
+
+                    float nodeCoefficientA[NUM_C*NUM_C], nodeCoefficientB[NUM_C*NUM_C], nodeCoefficientC[NUM_C*NUM_C], nodeCoefficientD[NUM_C*NUM_C];
+
+                    for(int c=0; c<NUM_C; c++){
+                        int indexYZ= ( (z + c) * controlPointImageDim.y + y) * controlPointImageDim.x;
+                        for(int b=0; b<NUM_C; b++){
+
+                            int indexXYZ = indexYZ + x;
+
+                            nodeCoefficientA[b + NUM_C*c] = controlPointPtr[indexXYZ++];
+                            nodeCoefficientB[b + NUM_C*c] = controlPointPtr[indexXYZ++];
+                            nodeCoefficientC[b + NUM_C*c] = controlPointPtr[indexXYZ++];
+                            nodeCoefficientD[b + NUM_C*c] = controlPointPtr[indexXYZ];
+
+                            indexYZ += controlPointImageDim.x;
+                        }
+                    }
+
+                    if (gridVoxelSpacing.x <= 8) {
+                        Vec8f z_h0_v, z_h1_v, y_h0_v, y_h1_v, x_h0_v, x_h1_v, z_g0_v, y_g0_v, x_g0_v;
+
+                        x_h0_v.load(x_h0_r);
+                        x_h1_v.load(x_h1_r);
+                        x_g0_v.load(x_g0);
+
+                        for (int k = 0; k < gridVoxelSpacing.z; ++k) {
+                            z_h0_v = z_h0_r[k];
+                            z_h1_v = z_h1_r[k];
+                            z_g0_v = z_g0[k];
+
+                            for (int j = 0; j < gridVoxelSpacing.y; ++j) {
+                                y_h0_v = y_h0_r[j];
+                                y_h1_v = y_h1_r[j];
+                                y_g0_v = y_g0[j];
+
+                                Vec8f c000_,c001_,c010_,c011_,c100_,c101_,c110_,c111_;
+
+                                c000_ = nodeCoefficientA[0*NUM_C];
+                                c001_ = nodeCoefficientA[0*NUM_C+NUM_C];
+                                c010_ = nodeCoefficientA[0*NUM_C+1];
+                                c011_ = nodeCoefficientA[0*NUM_C+NUM_C+1];
+                                c100_ = nodeCoefficientB[0*NUM_C];
+                                c101_ = nodeCoefficientB[0*NUM_C+NUM_C];
+                                c110_ = nodeCoefficientB[0*NUM_C+1];
+                                c111_ = nodeCoefficientB[0*NUM_C+NUM_C+1];
+
+                                c000_ = c000_ + z_h0_v*(c001_-c000_);
+                                c010_ = c010_ + z_h0_v*(c011_-c010_);
+                                c100_ = c100_ + z_h0_v*(c101_-c100_);
+                                c110_ = c110_ + z_h0_v*(c111_-c110_);
+
+                                c000_ = c000_ + y_h0_v*(c010_-c000_);
+                                c100_ = c100_ + y_h0_v*(c110_-c100_);
+
+                                Vec8f c000;
+                                c000 =  c000_ + x_h0_v*(c100_-c000_);
+
+                                c000_ = nodeCoefficientA[2*NUM_C];
+                                c001_ = nodeCoefficientA[2*NUM_C+NUM_C];
+                                c010_ = nodeCoefficientA[2*NUM_C+1];
+                                c011_ = nodeCoefficientA[2*NUM_C+NUM_C+1];
+                                c100_ = nodeCoefficientB[2*NUM_C];
+                                c101_ = nodeCoefficientB[2*NUM_C+NUM_C];
+                                c110_ = nodeCoefficientB[2*NUM_C+1];
+                                c111_ = nodeCoefficientB[2*NUM_C+NUM_C+1];
+
+                                c000_ = c000_ + z_h1_v*(c001_-c000_);
+                                c010_ = c010_ + z_h1_v*(c011_-c010_);
+                                c100_ = c100_ + z_h1_v*(c101_-c100_);
+                                c110_ = c110_ + z_h1_v*(c111_-c110_);
+
+                                c000_ = c000_ + y_h0_v*(c010_-c000_);
+                                c100_ = c100_ + y_h0_v*(c110_-c100_);
+
+                                Vec8f c001;
+                                c001 =  c000_ + x_h0_v*(c100_-c000_);
+
+                                c000_ = nodeCoefficientA[0*NUM_C+2];
+                                c001_ = nodeCoefficientA[0*NUM_C+NUM_C+2];
+                                c010_ = nodeCoefficientA[0*NUM_C+1+2];
+                                c011_ = nodeCoefficientA[0*NUM_C+NUM_C+1+2];
+                                c100_ = nodeCoefficientB[0*NUM_C+2];
+                                c101_ = nodeCoefficientB[0*NUM_C+NUM_C+2];
+                                c110_ = nodeCoefficientB[0*NUM_C+1+2];
+                                c111_ = nodeCoefficientB[0*NUM_C+NUM_C+1+2];
+
+                                c000_ = c000_ + z_h0_v*(c001_-c000_);
+                                c010_ = c010_ + z_h0_v*(c011_-c010_);
+                                c100_ = c100_ + z_h0_v*(c101_-c100_);
+                                c110_ = c110_ + z_h0_v*(c111_-c110_);
+
+                                c000_ = c000_ + y_h1_v*(c010_-c000_);
+                                c100_ = c100_ + y_h1_v*(c110_-c100_);
+
+                                Vec8f c010;
+                                c010 =  c000_ + x_h0_v*(c100_-c000_);
+
+                                c000_ = nodeCoefficientA[2*NUM_C+2];
+                                c001_ = nodeCoefficientA[2*NUM_C+NUM_C+2];
+                                c010_ = nodeCoefficientA[2*NUM_C+1+2];
+                                c011_ = nodeCoefficientA[2*NUM_C+NUM_C+1+2];
+                                c100_ = nodeCoefficientB[2*NUM_C+2];
+                                c101_ = nodeCoefficientB[2*NUM_C+NUM_C+2];
+                                c110_ = nodeCoefficientB[2*NUM_C+1+2];
+                                c111_ = nodeCoefficientB[2*NUM_C+NUM_C+1+2];
+
+                                c000_ = c000_ + z_h1_v*(c001_-c000_);
+                                c010_ = c010_ + z_h1_v*(c011_-c010_);
+                                c100_ = c100_ + z_h1_v*(c101_-c100_);
+                                c110_ = c110_ + z_h1_v*(c111_-c110_);
+
+                                c000_ = c000_ + y_h1_v*(c010_-c000_);
+                                c100_ = c100_ + y_h1_v*(c110_-c100_);
+
+                                Vec8f c011;
+                                c011 =  c000_ + x_h0_v*(c100_-c000_);
+
+                                c000_ = nodeCoefficientC[0*NUM_C];
+                                c001_ = nodeCoefficientC[0*NUM_C+NUM_C];
+                                c010_ = nodeCoefficientC[0*NUM_C+1];
+                                c011_ = nodeCoefficientC[0*NUM_C+NUM_C+1];
+                                c100_ = nodeCoefficientD[0*NUM_C];
+                                c101_ = nodeCoefficientD[0*NUM_C+NUM_C];
+                                c110_ = nodeCoefficientD[0*NUM_C+1];
+                                c111_ = nodeCoefficientD[0*NUM_C+NUM_C+1];
+
+                                c000_ = c000_ + z_h0_v*(c001_-c000_);
+                                c010_ = c010_ + z_h0_v*(c011_-c010_);
+                                c100_ = c100_ + z_h0_v*(c101_-c100_);
+                                c110_ = c110_ + z_h0_v*(c111_-c110_);
+
+                                c000_ = c000_ + y_h0_v*(c010_-c000_);
+                                c100_ = c100_ + y_h0_v*(c110_-c100_);
+
+                                Vec8f c100;
+                                c100 =  c000_ + x_h1_v*(c100_-c000_);
+
+                                c000_ = nodeCoefficientC[2*NUM_C];
+                                c001_ = nodeCoefficientC[2*NUM_C+NUM_C];
+                                c010_ = nodeCoefficientC[2*NUM_C+1];
+                                c011_ = nodeCoefficientC[2*NUM_C+NUM_C+1];
+                                c100_ = nodeCoefficientD[2*NUM_C];
+                                c101_ = nodeCoefficientD[2*NUM_C+NUM_C];
+                                c110_ = nodeCoefficientD[2*NUM_C+1];
+                                c111_ = nodeCoefficientD[2*NUM_C+NUM_C+1];
+
+                                c000_ = c000_ + z_h1_v*(c001_-c000_);
+                                c010_ = c010_ + z_h1_v*(c011_-c010_);
+                                c100_ = c100_ + z_h1_v*(c101_-c100_);
+                                c110_ = c110_ + z_h1_v*(c111_-c110_);
+
+                                c000_ = c000_ + y_h0_v*(c010_-c000_);
+                                c100_ = c100_ + y_h0_v*(c110_-c100_);
+
+                                Vec8f c101;
+                                c101 =  c000_ + x_h1_v*(c100_-c000_);
+
+                                c000_ = nodeCoefficientC[0*NUM_C+2];
+                                c001_ = nodeCoefficientC[0*NUM_C+NUM_C+2];
+                                c010_ = nodeCoefficientC[0*NUM_C+1+2];
+                                c011_ = nodeCoefficientC[0*NUM_C+NUM_C+1+2];
+                                c100_ = nodeCoefficientD[0*NUM_C+2];
+                                c101_ = nodeCoefficientD[0*NUM_C+NUM_C+2];
+                                c110_ = nodeCoefficientD[0*NUM_C+1+2];
+                                c111_ = nodeCoefficientD[0*NUM_C+NUM_C+1+2];
+
+                                c000_ = c000_ + z_h0_v*(c001_-c000_);
+                                c010_ = c010_ + z_h0_v*(c011_-c010_);
+                                c100_ = c100_ + z_h0_v*(c101_-c100_);
+                                c110_ = c110_ + z_h0_v*(c111_-c110_);
+
+                                c000_ = c000_ + y_h1_v*(c010_-c000_);
+                                c100_ = c100_ + y_h1_v*(c110_-c100_);
+
+                                Vec8f c110;
+                                c110 =  c000_ + x_h1_v*(c100_-c000_);
+
+                                c000_ = nodeCoefficientC[2*NUM_C+2];
+                                c001_ = nodeCoefficientC[2*NUM_C+NUM_C+2];
+                                c010_ = nodeCoefficientC[2*NUM_C+1+2];
+                                c011_ = nodeCoefficientC[2*NUM_C+NUM_C+1+2];
+                                c100_ = nodeCoefficientD[2*NUM_C+2];
+                                c101_ = nodeCoefficientD[2*NUM_C+NUM_C+2];
+                                c110_ = nodeCoefficientD[2*NUM_C+1+2];
+                                c111_ = nodeCoefficientD[2*NUM_C+NUM_C+1+2];
+
+                                c000_ = c000_ + z_h1_v*(c001_-c000_);
+                                c010_ = c010_ + z_h1_v*(c011_-c010_);
+                                c100_ = c100_ + z_h1_v*(c101_-c100_);
+                                c110_ = c110_ + z_h1_v*(c111_-c110_);
+
+                                c000_ = c000_ + y_h1_v*(c010_-c000_);
+                                c100_ = c100_ + y_h1_v*(c110_-c100_);
+
+                                Vec8f c111;
+                                c111 =  c000_ + x_h1_v*(c100_-c000_);
+
+
+                                c000 = c001 + z_g0_v*(c000-c001);
+                                c010 = c011 + z_g0_v*(c010-c011);
+                                c100 = c101 + z_g0_v*(c100-c101);
+                                c110 = c111 + z_g0_v*(c110-c111);
+
+                                c000 = c010 + y_g0_v*(c000-c010);
+                                c100 = c110 + y_g0_v*(c100-c110);
+
+                                c000 = c100 + x_g0_v*(c000-c100);
+
+                                c000.store_a(displacement);
+
+                                for (int i = 0; i < gridVoxelSpacing.x; ++i) {
+                                    int3_t imgCoord;
+                                    imgCoord.z = z*(int)gridVoxelSpacing.z+k;
+                                    imgCoord.y = y*(int)gridVoxelSpacing.y+j;
+                                    imgCoord.x = x*(int)gridVoxelSpacing.x+i;
+                                    unsigned int tmp_index = imgCoord.z * referenceImageDim.x * referenceImageDim.y
+                                            + imgCoord.y * referenceImageDim.x + imgCoord.x;
+                                    if (imgCoord.z < referenceImageDim.z && imgCoord.y < referenceImageDim.y &&
+                                            imgCoord.x < referenceImageDim.x)
+                                        fieldPtr[tmp_index] = displacement[i];
+                                }
+
+                            } // j
+                        } // k
+                    } else if (gridVoxelSpacing.x <= 16) {
+                        Vec8f z_h0_v, z_h1_v, y_h0_v, y_h1_v, z_g0_v, y_g0_v;
+                        Vec8f x_h0_vA, x_h1_vA, x_g0_vA;
+                        Vec8f x_h0_vB, x_h1_vB, x_g0_vB;
+
+                        x_h0_vA.load(x_h0_r);
+                        x_h1_vA.load(x_h1_r);
+                        x_g0_vA.load(x_g0);
+                        x_h0_vB.load(&x_h0_r[8]);
+                        x_h1_vB.load(&x_h1_r[8]);
+                        x_g0_vB.load(&x_g0[8]);
+
+                        for (int k = 0; k < gridVoxelSpacing.z; ++k) {
+                            z_h0_v = z_h0_r[k];
+                            z_h1_v = z_h1_r[k];
+                            z_g0_v = z_g0[k];
+
+                            for (int j = 0; j < gridVoxelSpacing.y; ++j) {
+                                y_h0_v = y_h0_r[j];
+                                y_h1_v = y_h1_r[j];
+                                y_g0_v = y_g0[j];
+
+                                Vec8f c000_,c001_,c010_,c011_,c100_,c101_,c110_,c111_;
+
+                                c000_ = nodeCoefficientA[0*NUM_C];
+                                c001_ = nodeCoefficientA[0*NUM_C+NUM_C];
+                                c010_ = nodeCoefficientA[0*NUM_C+1];
+                                c011_ = nodeCoefficientA[0*NUM_C+NUM_C+1];
+                                c100_ = nodeCoefficientB[0*NUM_C];
+                                c101_ = nodeCoefficientB[0*NUM_C+NUM_C];
+                                c110_ = nodeCoefficientB[0*NUM_C+1];
+                                c111_ = nodeCoefficientB[0*NUM_C+NUM_C+1];
+
+                                c000_ = c000_ + z_h0_v*(c001_-c000_);
+                                c010_ = c010_ + z_h0_v*(c011_-c010_);
+                                c100_ = c100_ + z_h0_v*(c101_-c100_);
+                                c110_ = c110_ + z_h0_v*(c111_-c110_);
+
+                                c000_ = c000_ + y_h0_v*(c010_-c000_);
+                                c100_ = c100_ + y_h0_v*(c110_-c100_);
+
+                                Vec8f c000A, c000B;
+                                c000A =  c000_ + x_h0_vA*(c100_-c000_);
+                                c000B =  c000_ + x_h0_vB*(c100_-c000_);
+
+                                c000_ = nodeCoefficientA[2*NUM_C];
+                                c001_ = nodeCoefficientA[2*NUM_C+NUM_C];
+                                c010_ = nodeCoefficientA[2*NUM_C+1];
+                                c011_ = nodeCoefficientA[2*NUM_C+NUM_C+1];
+                                c100_ = nodeCoefficientB[2*NUM_C];
+                                c101_ = nodeCoefficientB[2*NUM_C+NUM_C];
+                                c110_ = nodeCoefficientB[2*NUM_C+1];
+                                c111_ = nodeCoefficientB[2*NUM_C+NUM_C+1];
+
+                                c000_ = c000_ + z_h1_v*(c001_-c000_);
+                                c010_ = c010_ + z_h1_v*(c011_-c010_);
+                                c100_ = c100_ + z_h1_v*(c101_-c100_);
+                                c110_ = c110_ + z_h1_v*(c111_-c110_);
+
+                                c000_ = c000_ + y_h0_v*(c010_-c000_);
+                                c100_ = c100_ + y_h0_v*(c110_-c100_);
+
+                                Vec8f c001A, c001B;
+                                c001A =  c000_ + x_h0_vA*(c100_-c000_);
+                                c001B =  c000_ + x_h0_vB*(c100_-c000_);
+
+                                c000_ = nodeCoefficientA[0*NUM_C+2];
+                                c001_ = nodeCoefficientA[0*NUM_C+NUM_C+2];
+                                c010_ = nodeCoefficientA[0*NUM_C+1+2];
+                                c011_ = nodeCoefficientA[0*NUM_C+NUM_C+1+2];
+                                c100_ = nodeCoefficientB[0*NUM_C+2];
+                                c101_ = nodeCoefficientB[0*NUM_C+NUM_C+2];
+                                c110_ = nodeCoefficientB[0*NUM_C+1+2];
+                                c111_ = nodeCoefficientB[0*NUM_C+NUM_C+1+2];
+
+                                c000_ = c000_ + z_h0_v*(c001_-c000_);
+                                c010_ = c010_ + z_h0_v*(c011_-c010_);
+                                c100_ = c100_ + z_h0_v*(c101_-c100_);
+                                c110_ = c110_ + z_h0_v*(c111_-c110_);
+
+                                c000_ = c000_ + y_h1_v*(c010_-c000_);
+                                c100_ = c100_ + y_h1_v*(c110_-c100_);
+
+                                Vec8f c010A, c010B;
+                                c010A =  c000_ + x_h0_vA*(c100_-c000_);
+                                c010B =  c000_ + x_h0_vB*(c100_-c000_);
+
+                                c000_ = nodeCoefficientA[2*NUM_C+2];
+                                c001_ = nodeCoefficientA[2*NUM_C+NUM_C+2];
+                                c010_ = nodeCoefficientA[2*NUM_C+1+2];
+                                c011_ = nodeCoefficientA[2*NUM_C+NUM_C+1+2];
+                                c100_ = nodeCoefficientB[2*NUM_C+2];
+                                c101_ = nodeCoefficientB[2*NUM_C+NUM_C+2];
+                                c110_ = nodeCoefficientB[2*NUM_C+1+2];
+                                c111_ = nodeCoefficientB[2*NUM_C+NUM_C+1+2];
+
+                                c000_ = c000_ + z_h1_v*(c001_-c000_);
+                                c010_ = c010_ + z_h1_v*(c011_-c010_);
+                                c100_ = c100_ + z_h1_v*(c101_-c100_);
+                                c110_ = c110_ + z_h1_v*(c111_-c110_);
+
+                                c000_ = c000_ + y_h1_v*(c010_-c000_);
+                                c100_ = c100_ + y_h1_v*(c110_-c100_);
+
+                                Vec8f c011A, c011B;
+                                c011A =  c000_ + x_h0_vA*(c100_-c000_);
+                                c011B =  c000_ + x_h0_vB*(c100_-c000_);
+
+                                c000_ = nodeCoefficientC[0*NUM_C];
+                                c001_ = nodeCoefficientC[0*NUM_C+NUM_C];
+                                c010_ = nodeCoefficientC[0*NUM_C+1];
+                                c011_ = nodeCoefficientC[0*NUM_C+NUM_C+1];
+                                c100_ = nodeCoefficientD[0*NUM_C];
+                                c101_ = nodeCoefficientD[0*NUM_C+NUM_C];
+                                c110_ = nodeCoefficientD[0*NUM_C+1];
+                                c111_ = nodeCoefficientD[0*NUM_C+NUM_C+1];
+
+                                c000_ = c000_ + z_h0_v*(c001_-c000_);
+                                c010_ = c010_ + z_h0_v*(c011_-c010_);
+                                c100_ = c100_ + z_h0_v*(c101_-c100_);
+                                c110_ = c110_ + z_h0_v*(c111_-c110_);
+
+                                c000_ = c000_ + y_h0_v*(c010_-c000_);
+                                c100_ = c100_ + y_h0_v*(c110_-c100_);
+
+                                Vec8f c100A, c100B;
+                                c100A =  c000_ + x_h1_vA*(c100_-c000_);
+                                c100B =  c000_ + x_h1_vB*(c100_-c000_);
+
+                                c000_ = nodeCoefficientC[2*NUM_C];
+                                c001_ = nodeCoefficientC[2*NUM_C+NUM_C];
+                                c010_ = nodeCoefficientC[2*NUM_C+1];
+                                c011_ = nodeCoefficientC[2*NUM_C+NUM_C+1];
+                                c100_ = nodeCoefficientD[2*NUM_C];
+                                c101_ = nodeCoefficientD[2*NUM_C+NUM_C];
+                                c110_ = nodeCoefficientD[2*NUM_C+1];
+                                c111_ = nodeCoefficientD[2*NUM_C+NUM_C+1];
+
+                                c000_ = c000_ + z_h1_v*(c001_-c000_);
+                                c010_ = c010_ + z_h1_v*(c011_-c010_);
+                                c100_ = c100_ + z_h1_v*(c101_-c100_);
+                                c110_ = c110_ + z_h1_v*(c111_-c110_);
+
+                                c000_ = c000_ + y_h0_v*(c010_-c000_);
+                                c100_ = c100_ + y_h0_v*(c110_-c100_);
+
+                                Vec8f c101A, c101B;
+                                c101A =  c000_ + x_h1_vA*(c100_-c000_);
+                                c101B =  c000_ + x_h1_vB*(c100_-c000_);
+
+                                c000_ = nodeCoefficientC[0*NUM_C+2];
+                                c001_ = nodeCoefficientC[0*NUM_C+NUM_C+2];
+                                c010_ = nodeCoefficientC[0*NUM_C+1+2];
+                                c011_ = nodeCoefficientC[0*NUM_C+NUM_C+1+2];
+                                c100_ = nodeCoefficientD[0*NUM_C+2];
+                                c101_ = nodeCoefficientD[0*NUM_C+NUM_C+2];
+                                c110_ = nodeCoefficientD[0*NUM_C+1+2];
+                                c111_ = nodeCoefficientD[0*NUM_C+NUM_C+1+2];
+
+                                c000_ = c000_ + z_h0_v*(c001_-c000_);
+                                c010_ = c010_ + z_h0_v*(c011_-c010_);
+                                c100_ = c100_ + z_h0_v*(c101_-c100_);
+                                c110_ = c110_ + z_h0_v*(c111_-c110_);
+
+                                c000_ = c000_ + y_h1_v*(c010_-c000_);
+                                c100_ = c100_ + y_h1_v*(c110_-c100_);
+
+                                Vec8f c110A, c110B;
+                                c110A =  c000_ + x_h1_vA*(c100_-c000_);
+                                c110B =  c000_ + x_h1_vB*(c100_-c000_);
+
+                                c000_ = nodeCoefficientC[2*NUM_C+2];
+                                c001_ = nodeCoefficientC[2*NUM_C+NUM_C+2];
+                                c010_ = nodeCoefficientC[2*NUM_C+1+2];
+                                c011_ = nodeCoefficientC[2*NUM_C+NUM_C+1+2];
+                                c100_ = nodeCoefficientD[2*NUM_C+2];
+                                c101_ = nodeCoefficientD[2*NUM_C+NUM_C+2];
+                                c110_ = nodeCoefficientD[2*NUM_C+1+2];
+                                c111_ = nodeCoefficientD[2*NUM_C+NUM_C+1+2];
+
+                                c000_ = c000_ + z_h1_v*(c001_-c000_);
+                                c010_ = c010_ + z_h1_v*(c011_-c010_);
+                                c100_ = c100_ + z_h1_v*(c101_-c100_);
+                                c110_ = c110_ + z_h1_v*(c111_-c110_);
+
+                                c000_ = c000_ + y_h1_v*(c010_-c000_);
+                                c100_ = c100_ + y_h1_v*(c110_-c100_);
+
+                                Vec8f c111A, c111B;
+                                c111A =  c000_ + x_h1_vA*(c100_-c000_);
+                                c111B =  c000_ + x_h1_vB*(c100_-c000_);
+
+
+                                c000A = c001A + z_g0_v*(c000A-c001A);
+                                c010A = c011A + z_g0_v*(c010A-c011A);
+                                c100A = c101A + z_g0_v*(c100A-c101A);
+                                c110A = c111A + z_g0_v*(c110A-c111A);
+
+                                c000A = c010A + y_g0_v*(c000A-c010A);
+                                c100A = c110A + y_g0_v*(c100A-c110A);
+
+                                c000A = c100A + x_g0_vA*(c000A-c100A);
+
+                                c000B = c001B + z_g0_v*(c000B-c001B);
+                                c010B = c011B + z_g0_v*(c010B-c011B);
+                                c100B = c101B + z_g0_v*(c100B-c101B);
+                                c110B = c111B + z_g0_v*(c110B-c111B);
+
+                                c000B = c010B + y_g0_v*(c000B-c010B);
+                                c100B = c110B + y_g0_v*(c100B-c110B);
+
+                                c000B = c100B + x_g0_vB*(c000B-c100B);
+
+
+                                c000A.store_a(displacementA);
+                                c000B.store_a(displacementB);
+
+                                for (int i = 0; i < gridVoxelSpacing.x; ++i) {
+                                    int3_t imgCoord;
+                                    imgCoord.z = z*(int)gridVoxelSpacing.z+k;
+                                    imgCoord.y = y*(int)gridVoxelSpacing.y+j;
+                                    imgCoord.x = x*(int)gridVoxelSpacing.x+i;
+                                    unsigned int tmp_index = imgCoord.z * referenceImageDim.x * referenceImageDim.y
+                                            + imgCoord.y * referenceImageDim.x + imgCoord.x;
+                                    if (imgCoord.z < referenceImageDim.z && imgCoord.y < referenceImageDim.y &&
+                                            imgCoord.x < referenceImageDim.x)
+                                        fieldPtr[tmp_index] = i < 8 ? displacementA[i] : displacementB[i-8] ;
+                                }
+
+                            } // j
+                        } // k
+
+                    } // if
+
+                    controlPointPtr =
+                            &controlPointPtr[splineControlPoint->nx*splineControlPoint->ny*splineControlPoint->nz];
+                    fieldPtr = &fieldPtr[deformationField->nx*deformationField->ny*deformationField->nz];
+                } // coord
+
+            } // x
+        } // y
+    } // z
+}
+    return;
+}
+/* *************************************************************** */
+/* ******** Vector per Voxel + !!! AVX needed !!! ******* */
+void reg_spline_getDeformationField3D10omp(nifti_image *splineControlPoint, nifti_image *referenceImage,
+        nifti_image *deformationField, const int3_t gridVoxelSpacing, const int3_t tilesDim)
+{
+    const int3_t referenceImageDim = {referenceImage->nx, referenceImage->ny, referenceImage->nz};
+    const int3_t controlPointImageDim = {splineControlPoint->nx, splineControlPoint->ny, splineControlPoint->nz};
+
+    float *controlPointPtrX = static_cast<float *>(splineControlPoint->data);
+    float *controlPointPtrY = &controlPointPtrX[splineControlPoint->nx*splineControlPoint->ny*splineControlPoint->nz];
+    float *controlPointPtrZ = &controlPointPtrY[splineControlPoint->nx*splineControlPoint->ny*splineControlPoint->nz];
+
+    float *fieldPtrX=static_cast<float *>(deformationField->data);
+    float *fieldPtrY=&fieldPtrX[deformationField->nx*deformationField->ny*deformationField->nz];
+    float *fieldPtrZ=&fieldPtrY[deformationField->nx*deformationField->ny*deformationField->nz];
+
+#pragma omp parallel num_threads(NUM_THREADS)
+{
+#pragma omp for nowait
+
+    for (int z = 0; z < tilesDim.z; ++z) {
+        for (int y = 0; y < tilesDim.y; ++y) {
+            for (int x = 0; x < tilesDim.x; ++x) {
+
+                float nCX[VECTOR_ELEM * 8] __attribute__((aligned(32)));
+                float nCY[VECTOR_ELEM * 8] __attribute__((aligned(32)));
+                float nCZ[VECTOR_ELEM * 8] __attribute__((aligned(32)));
+
+                float displacement[VECTOR_ELEM] __attribute__((aligned(32)));
+
+                float *c000X = &nCX[0], *c001X = &nCX[8], *c010X = &nCX[16], *c011X = &nCX[24], *c100X = &nCX[32],
+                        *c101X = &nCX[40], *c110X = &nCX[48], *c111X = &nCX[56];
+                float *c000Y = &nCY[0], *c001Y = &nCY[8], *c010Y = &nCY[16], *c011Y = &nCY[24], *c100Y = &nCY[32],
+                        *c101Y = &nCY[40], *c110Y = &nCY[48], *c111Y = &nCY[56];
+                float *c000Z = &nCZ[0], *c001Z = &nCZ[8], *c010Z = &nCZ[16], *c011Z = &nCZ[24], *c100Z = &nCZ[32],
+                        *c101Z = &nCZ[40], *c110Z = &nCZ[48], *c111Z = &nCZ[56];
+
+                for(int c=0; c<NUM_C; c++){
+                    int indexYZ= ( (z + c) * controlPointImageDim.y + y) * controlPointImageDim.x;
+                    for(int b=0; b<NUM_C; b++){
+                        int indexXYZ = indexYZ + x;
+
+                        if        ( !(b & 1) && !(c & 1) ) {
+                            *c000X = controlPointPtrX[indexXYZ];
+                            *c000Y = controlPointPtrY[indexXYZ];
+                            *c000Z = controlPointPtrZ[indexXYZ];
+                            indexXYZ++;
+                            c000X++;
+                            c000Y++;
+                            c000Z++;
+                            *c100X = controlPointPtrX[indexXYZ];
+                            *c100Y = controlPointPtrY[indexXYZ];
+                            *c100Z = controlPointPtrZ[indexXYZ];
+                            indexXYZ++;
+                            c100X++;
+                            c100Y++;
+                            c100Z++;
+                            *c000X = controlPointPtrX[indexXYZ];
+                            *c000Y = controlPointPtrY[indexXYZ];
+                            *c000Z = controlPointPtrZ[indexXYZ];
+                            indexXYZ++;
+                            c000X++;
+                            c000Y++;
+                            c000Z++;
+                            *c100X = controlPointPtrX[indexXYZ];
+                            *c100Y = controlPointPtrY[indexXYZ];
+                            *c100Z = controlPointPtrZ[indexXYZ];
+                            c100X++;
+                            c100Y++;
+                            c100Z++;
+                        } else if ( !(b & 1) &&  (c & 1) ) {
+                            *c001X = controlPointPtrX[indexXYZ];
+                            *c001Y = controlPointPtrY[indexXYZ];
+                            *c001Z = controlPointPtrZ[indexXYZ];
+                            indexXYZ++;
+                            c001X++;
+                            c001Y++;
+                            c001Z++;
+                            *c101X = controlPointPtrX[indexXYZ];
+                            *c101Y = controlPointPtrY[indexXYZ];
+                            *c101Z = controlPointPtrZ[indexXYZ];
+                            indexXYZ++;
+                            c101X++;
+                            c101Y++;
+                            c101Z++;
+                            *c001X = controlPointPtrX[indexXYZ];
+                            *c001Y = controlPointPtrY[indexXYZ];
+                            *c001Z = controlPointPtrZ[indexXYZ];
+                            indexXYZ++;
+                            c001X++;
+                            c001Y++;
+                            c001Z++;
+                            *c101X = controlPointPtrX[indexXYZ];
+                            *c101Y = controlPointPtrY[indexXYZ];
+                            *c101Z = controlPointPtrZ[indexXYZ];
+                            c101X++;
+                            c101Y++;
+                            c101Z++;
+                        } else if ( (b & 1) && !(c & 1) ) {
+                            *c010X = controlPointPtrX[indexXYZ];
+                            *c010Y = controlPointPtrY[indexXYZ];
+                            *c010Z = controlPointPtrZ[indexXYZ];
+                            indexXYZ++;
+                            c010X++;
+                            c010Y++;
+                            c010Z++;
+                            *c110X = controlPointPtrX[indexXYZ];
+                            *c110Y = controlPointPtrY[indexXYZ];
+                            *c110Z = controlPointPtrZ[indexXYZ];
+                            indexXYZ++;
+                            c110X++;
+                            c110Y++;
+                            c110Z++;
+                            *c010X = controlPointPtrX[indexXYZ];
+                            *c010Y = controlPointPtrY[indexXYZ];
+                            *c010Z = controlPointPtrZ[indexXYZ];
+                            indexXYZ++;
+                            c010X++;
+                            c010Y++;
+                            c010Z++;
+                            *c110X = controlPointPtrX[indexXYZ];
+                            *c110Y = controlPointPtrY[indexXYZ];
+                            *c110Z = controlPointPtrZ[indexXYZ];
+                            c110X++;
+                            c110Y++;
+                            c110Z++;
+                        } else if ( (b & 1) &&  (c & 1) ) {
+                            *c011X = controlPointPtrX[indexXYZ];
+                            *c011Y = controlPointPtrY[indexXYZ];
+                            *c011Z = controlPointPtrZ[indexXYZ];
+                            indexXYZ++;
+                            c011X++;
+                            c011Y++;
+                            c011Z++;
+                            *c111X = controlPointPtrX[indexXYZ];
+                            *c111Y = controlPointPtrY[indexXYZ];
+                            *c111Z = controlPointPtrZ[indexXYZ];
+                            indexXYZ++;
+                            c111X++;
+                            c111Y++;
+                            c111Z++;
+                            *c011X = controlPointPtrX[indexXYZ];
+                            *c011Y = controlPointPtrY[indexXYZ];
+                            *c011Z = controlPointPtrZ[indexXYZ];
+                            indexXYZ++;
+                            c011X++;
+                            c011Y++;
+                            c011Z++;
+                            *c111X = controlPointPtrX[indexXYZ];
+                            *c111Y = controlPointPtrY[indexXYZ];
+                            *c111Z = controlPointPtrZ[indexXYZ];
+                            c111X++;
+                            c111Y++;
+                            c111Z++;
+                        }
+
+                        indexYZ += controlPointImageDim.x;
+                    }
+                }
+
+                Vec8f c000_X,c001_X,c010_X,c011_X,c100_X,c101_X,c110_X,c111_X;
+                Vec8f c000_Y,c001_Y,c010_Y,c011_Y,c100_Y,c101_Y,c110_Y,c111_Y;
+                Vec8f c000_Z,c001_Z,c010_Z,c011_Z,c100_Z,c101_Z,c110_Z,c111_Z;
+                c000_X.load_a(&nCX[0]);
+                c001_X.load_a(&nCX[8]);
+                c010_X.load_a(&nCX[16]);
+                c011_X.load_a(&nCX[24]);
+                c100_X.load_a(&nCX[32]);
+                c101_X.load_a(&nCX[40]);
+                c110_X.load_a(&nCX[48]);
+                c111_X.load_a(&nCX[56]);
+                c000_Y.load_a(&nCY[0]);
+                c001_Y.load_a(&nCY[8]);
+                c010_Y.load_a(&nCY[16]);
+                c011_Y.load_a(&nCY[24]);
+                c100_Y.load_a(&nCY[32]);
+                c101_Y.load_a(&nCY[40]);
+                c110_Y.load_a(&nCY[48]);
+                c111_Y.load_a(&nCY[56]);
+                c000_Z.load_a(&nCZ[0]);
+                c001_Z.load_a(&nCZ[8]);
+                c010_Z.load_a(&nCZ[16]);
+                c011_Z.load_a(&nCZ[24]);
+                c100_Z.load_a(&nCZ[32]);
+                c101_Z.load_a(&nCZ[40]);
+                c110_Z.load_a(&nCZ[48]);
+                c111_Z.load_a(&nCZ[56]);
+
+                for (int k = 0; k < gridVoxelSpacing.z; ++k) {
+                    for (int j = 0; j < gridVoxelSpacing.y; ++j) {
+                        for (int i = 0; i < gridVoxelSpacing.x; ++i) {
+                            Vec8f z_h, y_h, x_h, z_h0, z_h1, y_h0, y_h1, x_h0, x_h1;
+                            z_h0 = z_h0_r[k];
+                            z_h1 = z_h1_r[k];
+                            y_h0 = y_h0_r[j];
+                            y_h1 = y_h1_r[j];
+                            x_h0 = x_h0_r[i];
+                            x_h1 = x_h1_r[i];
+
+                            x_h = blend8f<0,8,0,8,0,8,0,8>(x_h0, x_h1);
+                            y_h = blend8f<0,0,8,8,0,0,8,8>(y_h0, y_h1);
+                            z_h = blend8f<0,0,0,0,8,8,8,8>(z_h0, z_h1);
+
+                            Vec8f c000_vX, c010_vX, c100_vX, c110_vX;
+                            Vec8f c000_vY, c010_vY, c100_vY, c110_vY;
+                            Vec8f c000_vZ, c010_vZ, c100_vZ, c110_vZ;
+
+                            c000_vX = c000_X +  z_h*(c001_X- c000_X);
+                            c010_vX = c010_X +  z_h*(c011_X- c010_X);
+                            c100_vX = c100_X +  z_h*(c101_X- c100_X);
+                            c110_vX = c110_X +  z_h*(c111_X- c110_X);
+                            c000_vY = c000_Y +  z_h*(c001_Y- c000_Y);
+                            c010_vY = c010_Y +  z_h*(c011_Y- c010_Y);
+                            c100_vY = c100_Y +  z_h*(c101_Y- c100_Y);
+                            c110_vY = c110_Y +  z_h*(c111_Y- c110_Y);
+                            c000_vZ = c000_Z +  z_h*(c001_Z- c000_Z);
+                            c010_vZ = c010_Z +  z_h*(c011_Z- c010_Z);
+                            c100_vZ = c100_Z +  z_h*(c101_Z- c100_Z);
+                            c110_vZ = c110_Z +  z_h*(c111_Z- c110_Z);
+
+                            c000_vX = c000_vX + y_h*(c010_vX-c000_vX);
+                            c100_vX = c100_vX + y_h*(c110_vX-c100_vX);
+                            c000_vY = c000_vY + y_h*(c010_vY-c000_vY);
+                            c100_vY = c100_vY + y_h*(c110_vY-c100_vY);
+                            c000_vZ = c000_vZ + y_h*(c010_vZ-c000_vZ);
+                            c100_vZ = c100_vZ + y_h*(c110_vZ-c100_vZ);
+
+                            Vec8f dispX;
+                            Vec8f dispY;
+                            Vec8f dispZ;
+                            dispX =  c000_vX + x_h*(c100_vX-c000_vX);
+                            dispY =  c000_vY + x_h*(c100_vY-c000_vY);
+                            dispZ =  c000_vZ + x_h*(c100_vZ-c000_vZ);
+
+                            Vec8f hsubXY, hsubXYZ;
+                            Vec8f x_g = x_g0[i];
+                            Vec8f y_g = y_g0[j];
+                            Vec8f z_g = z_g0[k];
+
+                            hsubXY = blend8f<1, 3, 9, 11, 5, 7, 13, 15>(dispX, dispY) + x_g * _mm256_hsub_ps(dispX, dispY);
+
+                            hsubXYZ = blend8f<1, 3, 9, 11, 5, 7, 13, 15>(hsubXY, dispZ) +
+                                    blend8f<0, 1, 10, 11, 4, 5, 14, 15>(y_g, x_g) * _mm256_hsub_ps(hsubXY, dispZ);
+
+                            Vec8f subXYZ, disp;
+                            subXYZ = permute8f<4, 5, 3, -256, -256, -256, 7, -256>(hsubXYZ);
+                            disp = subXYZ + blend8f<0, 1, 10, -256, -256, -256, 14, -256>(z_g, y_g) * (hsubXYZ - subXYZ);
+
+                            disp.store_a(displacement);
+
+                            float displacementZ = displacement[6] + z_g0[k]*(displacement[2]-displacement[6]);
+
+                            int3_t imgCoord;
+                            imgCoord.z = z*(int)gridVoxelSpacing.z+k;
+                            imgCoord.y = y*(int)gridVoxelSpacing.y+j;
+                            imgCoord.x = x*(int)gridVoxelSpacing.x+i;
+                            unsigned int tmp_index = imgCoord.z*referenceImageDim.x*referenceImageDim.y +
+                                    imgCoord.y*referenceImageDim.x + imgCoord.x;
+                            if (imgCoord.z < referenceImageDim.z && imgCoord.y < referenceImageDim.y &&
+                                    imgCoord.x < referenceImageDim.x) {
+                                fieldPtrX[tmp_index] = displacement[0];
+                                fieldPtrY[tmp_index] = displacement[1];
+                                fieldPtrZ[tmp_index] = displacementZ;
+                            }
+                        } // i
+                    } // j
+                } // k
+            } // x
+        } // y
+    } // z
+}
+
+    return;
+}
+/* *************************************************************** */
+
+/* *************************************************************** */
 void reg_spline_getDeformationField(nifti_image *splineControlPoint,
                                     nifti_image *referenceImage,
                                     nifti_image *deformationField,
@@ -1230,7 +2473,7 @@ void reg_spline_getDeformationField(nifti_image *splineControlPoint,
         exit(1);
     }
 
-#if _USE_SSE
+#ifdef _USE_SSE
     if(splineControlPoint->datatype != NIFTI_TYPE_FLOAT32){
         fprintf(stderr,"[NiftyReg ERROR] SSE computation has only been implemented for single precision.\n");
         fprintf(stderr,"[NiftyReg ERROR] The deformation field is not computed\n");
@@ -1274,6 +2517,320 @@ void reg_spline_getDeformationField(nifti_image *splineControlPoint,
         }
     }
     if(MrPropre==true) free(mask);
+
+    return;
+}
+/* *************************************************************** */
+/* ************* Here we evaluate the performance of the CPU B-spline interpolation implementations ************ */
+void reg_spline_getDeformationField_testing(nifti_image *splineControlPoint,
+                                    nifti_image *referenceImage,
+                                    nifti_image *deformationField,
+                                    int *mask,
+                                    bool composition,
+                                    bool bspline)
+{
+    if(splineControlPoint->datatype != deformationField->datatype){
+        fprintf(stderr,"[NiftyReg ERROR] The spline control point image and the deformation field image are expected to be the same type\n");
+        fprintf(stderr,"[NiftyReg ERROR] The deformation field is not computed\n");
+        exit(1);
+    }
+
+#ifdef _USE_SSE
+    if(splineControlPoint->datatype != NIFTI_TYPE_FLOAT32){
+        fprintf(stderr,"[NiftyReg ERROR] SSE computation has only been implemented for single precision.\n");
+        fprintf(stderr,"[NiftyReg ERROR] The deformation field is not computed\n");
+        exit(1);
+    }
+#endif
+
+    FILE *f = fopen("results_cpu.txt", "a"); //id, level, data_in, execution, data_out, accuracy, errors
+    if (f == NULL)
+    {
+        printf("Error opening file!\n");
+        exit(1);
+    }
+
+    const float3_t controlPointVoxelSpacing = make_float3_t(splineControlPoint->dx / referenceImage->dx,
+                                                            splineControlPoint->dy / referenceImage->dy,
+                                                            splineControlPoint->dz / referenceImage->dz);
+    const int3_t controlPointVoxelSpacing_i = make_int3_t(lrintf( controlPointVoxelSpacing.x ),
+                                                          lrintf( controlPointVoxelSpacing.y ),
+                                                          lrintf( controlPointVoxelSpacing.z ));
+
+    bool MrPropre=false;
+    if(mask==NULL){
+        // Active voxel are all superior to -1, 0 thus will do !
+        MrPropre=true;
+        mask=(int *)calloc(deformationField->nx*deformationField->ny*deformationField->nz, sizeof(int));
+    }
+
+    if(splineControlPoint->nz==1){
+        switch(deformationField->datatype){
+        case NIFTI_TYPE_FLOAT32:
+            reg_spline_getDeformationField2D<float>(splineControlPoint, referenceImage, deformationField, mask, composition, bspline);
+            break;
+        case NIFTI_TYPE_FLOAT64:
+            reg_spline_getDeformationField2D<double>(splineControlPoint, referenceImage, deformationField, mask, composition, bspline);
+            break;
+        default:
+            fprintf(stderr,"[NiftyReg ERROR] Only single or double precision is implemented for deformation field\n");
+            fprintf(stderr,"[NiftyReg ERROR] The deformation field is not computed\n");
+            exit(1);
+        }
+    }
+    else{
+        switch(deformationField->datatype){
+        case NIFTI_TYPE_FLOAT32:
+        {
+            const int3_t tilesDim = make_int3_t(ceilf((float)referenceImage->nx / (float)controlPointVoxelSpacing.x),
+                                                ceilf((float)referenceImage->ny / (float)controlPointVoxelSpacing.y),
+                                                ceilf((float)referenceImage->nz / (float)controlPointVoxelSpacing.z));
+
+            create_weights_LUT(controlPointVoxelSpacing, controlPointVoxelSpacing_i);
+
+            static int level;
+            static int currentVoxelNumber = 0;
+            if (currentVoxelNumber == 0) {
+                currentVoxelNumber = deformationField->nx;
+                level = 0;
+            } else if (deformationField->nx > currentVoxelNumber) {
+                currentVoxelNumber = deformationField->nx;
+                level++;
+            }
+
+
+#pragma omp parallel
+          {
+            volatile unsigned x=0, y=1;
+            long int count = 0;
+            while (x++ || y++) {
+                if (count == 10000000000l) break;
+                count++;
+            }
+          }
+
+#define ID 7 //findme, valid values = 0,6,7
+
+
+            timespec startCPU, stopCPU;
+            clock_gettime(CLOCK_MONOTONIC_RAW, &startCPU);
+#if ID == 0
+            reg_spline_getDeformationField3D2(splineControlPoint, referenceImage, deformationField);
+#elif ID == 6
+            reg_spline_getDeformationField3D7omp16(splineControlPoint, referenceImage, deformationField,
+                    controlPointVoxelSpacing_i, tilesDim);
+#elif ID == 7
+            reg_spline_getDeformationField3D10omp(splineControlPoint, referenceImage, deformationField,
+                    controlPointVoxelSpacing_i, tilesDim);
+#endif
+
+            clock_gettime(CLOCK_MONOTONIC_RAW, &stopCPU);
+            double accum = ( stopCPU.tv_sec - startCPU.tv_sec ) * 1000L + (double)( stopCPU.tv_nsec - startCPU.tv_nsec ) / 1000000L;
+
+            fprintf(f, "%d,%d,0.0,%lf,0.0,",ID, level, accum);
+            printf("**** CPU Bspline kernel time: %lfms\n", accum);
+        }
+            break;
+        case NIFTI_TYPE_FLOAT64:
+            reg_spline_getDeformationField3D<double>(splineControlPoint, referenceImage, deformationField, mask, composition, bspline);
+            break;
+        default:
+            fprintf(stderr,"[NiftyReg ERROR] Only single or double precision is implemented for deformation field\n");
+            fprintf(stderr,"[NiftyReg ERROR] The deformation field is not computed\n");
+            exit(1);
+        }
+    }
+
+    int activeVoxelNumber = deformationField->nx*deformationField->ny*deformationField->nz;
+    const size_t outCount(activeVoxelNumber *3);
+    const size_t memoryReq(outCount * sizeof(float));
+
+    int controlPointNumber = splineControlPoint->nx*splineControlPoint->ny*splineControlPoint->nz;
+    const size_t inCount(controlPointNumber *3);
+
+    float* fieldPtr = new float[outCount];
+    memcpy(fieldPtr, deformationField->data, memoryReq);
+
+    float *fieldPtrX = fieldPtr;
+    float *fieldPtrY=&fieldPtrX[deformationField->nx*deformationField->ny*deformationField->nz];
+    float *fieldPtrZ=&fieldPtrY[deformationField->nx*deformationField->ny*deformationField->nz];
+
+    /************************ test correctness *****************************/
+    memset(deformationField->data, 0, memoryReq);
+    reg_spline_getDeformationField3D<float>(splineControlPoint, referenceImage, deformationField, mask, composition, bspline);
+
+    float* hostDataFloat4Ground = new float[outCount];
+    memcpy(hostDataFloat4Ground, deformationField->data, memoryReq);
+
+    float *hostDataFloat4GroundX = hostDataFloat4Ground;
+    float *hostDataFloat4GroundY = &hostDataFloat4GroundX[deformationField->nx*deformationField->ny*deformationField->nz];
+    float *hostDataFloat4GroundZ = &hostDataFloat4GroundY[deformationField->nx*deformationField->ny*deformationField->nz];
+
+    /************************ test accuracy *****************************/
+    void *splineControlPointFloat = splineControlPoint->data;
+    void *deformationFieldFloat = deformationField->data;
+
+    double *splineControlPointDouble = new double[inCount];
+    double *deformationFieldDouble = new double[outCount];
+
+    for (int i = 0; i < inCount; ++i) {
+        splineControlPointDouble[i] = static_cast<double>(static_cast<float *>(splineControlPoint->data)[i]);
+    }
+
+    splineControlPoint->data = splineControlPointDouble;
+    deformationField->data = deformationFieldDouble;
+
+    reg_spline_getDeformationField3D3_double(splineControlPoint, referenceImage, deformationField);
+
+    splineControlPoint->data = splineControlPointFloat;
+    deformationField->data = deformationFieldFloat;
+
+    double *positionFieldImageArrayDouble_hX = deformationFieldDouble;
+    double *positionFieldImageArrayDouble_hY = &positionFieldImageArrayDouble_hX[deformationField->nx*deformationField->ny*deformationField->nz];
+    double *positionFieldImageArrayDouble_hZ = &positionFieldImageArrayDouble_hY[deformationField->nx*deformationField->ny*deformationField->nz];
+
+    /************************ run the tests *****************************/
+
+    int errors = 0;
+    double3_t average_error = make_double3_t(0.0, 0.0, 0.0);
+    int count_x = 0,count_y = 0,count_z = 0;
+    int x, y, z;
+    float e = 1.f;
+    for (int i = 0; i < activeVoxelNumber; ++i) {
+        average_error.x = average_error.x + fabs( (double)fieldPtrX[i] - positionFieldImageArrayDouble_hX[i] );
+        average_error.y = average_error.y + fabs( (double)fieldPtrY[i] - positionFieldImageArrayDouble_hY[i] );
+        average_error.z = average_error.z + fabs( (double)fieldPtrZ[i] - positionFieldImageArrayDouble_hZ[i] );
+
+        errors += fabs( fieldPtrX[i] - hostDataFloat4GroundX[i] ) > e;
+        errors += fabs( fieldPtrY[i] - hostDataFloat4GroundY[i] ) > e;
+        errors += fabs( fieldPtrZ[i] - hostDataFloat4GroundZ[i] ) > e;
+        z = (i / (referenceImage->ny * referenceImage->nx));
+        y = (i % (referenceImage->ny * referenceImage->nx)) / referenceImage->nx;
+        x = (i % (referenceImage->ny * referenceImage->nx)) % referenceImage->nx;
+        if (fabs( fieldPtrX[i] - hostDataFloat4GroundX[i] ) > e){
+            count_x++;
+        }
+        if (fabs( fieldPtrY[i] - hostDataFloat4GroundY[i] ) > e){
+            count_y++;
+        }
+        if (fabs( fieldPtrZ[i] - hostDataFloat4GroundZ[i] ) > e){
+            count_z++;
+        }
+    }
+    average_error = average_error / activeVoxelNumber;
+    double average_xyz = (average_error.x + average_error.y + average_error.z) / 3;
+
+    fprintf(f, "%.10f,%d,%d,%d,%d\n", average_xyz, errors, controlPointVoxelSpacing_i.x, controlPointVoxelSpacing_i.y, controlPointVoxelSpacing_i.z);
+
+    printf("**** Average error in x: %f, y: %f, z: %f\n", average_error.x, average_error.y, average_error.z);
+    printf("**** Number of errors in x: %d, y: %d, z: %d\n", count_x, count_y, count_z);
+    printf("**** Number of misalignment errors: %d\n", errors);
+
+    fclose(f);
+
+    if(MrPropre==true) free(mask);
+
+    delete[] hostDataFloat4Ground;
+    delete[] fieldPtr;
+//    delete[] splineControlPointFloat;
+    delete[] splineControlPointDouble;
+//    delete[] deformationFieldFloat;
+    delete[] deformationFieldDouble;
+
+    return;
+}
+/* *************************************************************** */
+/* **************** Here we compare the performance of our approach in registration ***************** */
+void reg_spline_getDeformationField_test_reg(nifti_image *splineControlPoint,
+                                    nifti_image *referenceImage,
+                                    nifti_image *deformationField,
+                                    int *mask,
+                                    bool composition,
+                                    bool bspline)
+{
+    if(splineControlPoint->datatype != deformationField->datatype){
+        fprintf(stderr,"[NiftyReg ERROR] The spline control point image and the deformation field image are expected to be the same type\n");
+        fprintf(stderr,"[NiftyReg ERROR] The deformation field is not computed\n");
+        exit(1);
+    }
+
+#ifdef _USE_SSE
+    if(splineControlPoint->datatype != NIFTI_TYPE_FLOAT32){
+        fprintf(stderr,"[NiftyReg ERROR] SSE computation has only been implemented for single precision.\n");
+        fprintf(stderr,"[NiftyReg ERROR] The deformation field is not computed\n");
+        exit(1);
+    }
+#endif
+
+    bool MrPropre=false;
+    if(mask==NULL){
+        // Active voxel are all superior to -1, 0 thus will do !
+        MrPropre=true;
+        mask=(int *)calloc(deformationField->nx*deformationField->ny*deformationField->nz, sizeof(int));
+    }
+
+    if(splineControlPoint->nz==1){
+        switch(deformationField->datatype){
+        case NIFTI_TYPE_FLOAT32:
+            reg_spline_getDeformationField2D<float>(splineControlPoint, referenceImage, deformationField, mask, composition, bspline);
+            break;
+        case NIFTI_TYPE_FLOAT64:
+            reg_spline_getDeformationField2D<double>(splineControlPoint, referenceImage, deformationField, mask, composition, bspline);
+            break;
+        default:
+            fprintf(stderr,"[NiftyReg ERROR] Only single or double precision is implemented for deformation field\n");
+            fprintf(stderr,"[NiftyReg ERROR] The deformation field is not computed\n");
+            exit(1);
+        }
+    }
+    else{
+        switch(deformationField->datatype){
+        case NIFTI_TYPE_FLOAT32:
+        {
+
+#define IDR 2 //findtoo, Valid values 1,2: 1 original, 2 accelerated
+
+#if IDR == 2
+            const float3_t controlPointVoxelSpacing = make_float3_t(splineControlPoint->dx / referenceImage->dx,
+                                                                    splineControlPoint->dy / referenceImage->dy,
+                                                                    splineControlPoint->dz / referenceImage->dz);
+            const int3_t controlPointVoxelSpacing_i = make_int3_t(lrintf( controlPointVoxelSpacing.x ),
+                                                                  lrintf( controlPointVoxelSpacing.y ),
+                                                                  lrintf( controlPointVoxelSpacing.z ));
+
+
+            const int3_t tilesDim = make_int3_t(ceilf((float)referenceImage->nx / (float)controlPointVoxelSpacing.x),
+                                                ceilf((float)referenceImage->ny / (float)controlPointVoxelSpacing.y),
+                                                ceilf((float)referenceImage->nz / (float)controlPointVoxelSpacing.z));
+
+            create_weights_LUT(controlPointVoxelSpacing, controlPointVoxelSpacing_i);
+#endif
+
+#ifdef _USE_SSE
+#if IDR == 1
+    reg_spline_getDeformationField3D2(splineControlPoint, referenceImage, deformationField);
+#endif
+#if IDR == 2
+    reg_spline_getDeformationField3D7omp16(splineControlPoint, referenceImage, deformationField,
+            controlPointVoxelSpacing_i, tilesDim);
+#endif
+#else //_USE_SSE
+            reg_spline_getDeformationField3D<float>(splineControlPoint, referenceImage, deformationField, mask, composition, bspline);
+#endif //_USE_SSE
+
+        }
+            break;
+        case NIFTI_TYPE_FLOAT64:
+            reg_spline_getDeformationField3D<double>(splineControlPoint, referenceImage, deformationField, mask, composition, bspline);
+            break;
+        default:
+            fprintf(stderr,"[NiftyReg ERROR] Only single or double precision is implemented for deformation field\n");
+            fprintf(stderr,"[NiftyReg ERROR] The deformation field is not computed\n");
+            exit(1);
+        }
+    }
+    if(MrPropre==true) free(mask);
+
     return;
 }
 /* *************************************************************** */

@@ -25,6 +25,22 @@ void reg_bspline_gpu(   nifti_image *controlPointImage,
                         int **mask,
                         int activeVoxelNumber,
                         bool bspline);
+extern "C++"
+void reg_bspline_testing(   nifti_image *controlPointImage,
+                        nifti_image *targetImage,
+                        float4 **controlPointImageArray_d,
+                        float4 **positionFieldImageArray_d,
+                        int **mask,
+                        int activeVoxelNumber,
+                        bool bspline);
+extern "C++"
+void reg_bspline_test_reg(   nifti_image *controlPointImage,
+                        nifti_image *targetImage,
+                        float4 **controlPointImageArray_d,
+                        float4 **positionFieldImageArray_d,
+                        int **mask,
+                        int activeVoxelNumber,
+                        bool bspline);
 
 /* BE */
 extern "C++"

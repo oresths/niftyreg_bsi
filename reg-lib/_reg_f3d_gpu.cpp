@@ -484,7 +484,23 @@ void reg_f3d_gpu<T>::GetDeformationField()
     }
     else{
        // Compute the deformation field
-        reg_bspline_gpu(this->controlPointGrid,
+//        reg_bspline_gpu(this->controlPointGrid,
+//                        this->currentReference,
+//                        &this->controlPointGrid_gpu,
+//                        &this->deformationFieldImage_gpu,
+//                        &this->currentMask_gpu,
+//                        this->activeVoxelNumber[this->currentLevel],
+//                        true // use B-splines
+//                        );
+//        reg_bspline_testing(this->controlPointGrid,
+//                        this->currentReference,
+//                        &this->controlPointGrid_gpu,
+//                        &this->deformationFieldImage_gpu,
+//                        &this->currentMask_gpu,
+//                        this->activeVoxelNumber[this->currentLevel],
+//                        true // use B-splines
+//                        );
+        reg_bspline_test_reg(this->controlPointGrid,
                         this->currentReference,
                         &this->controlPointGrid_gpu,
                         &this->deformationFieldImage_gpu,

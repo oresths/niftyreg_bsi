@@ -19,11 +19,33 @@ __device__ __constant__ int c_VoxelNumber;
 __device__ __constant__ int c_ControlPointNumber;
 __device__ __constant__ int3 c_ReferenceImageDim;
 __device__ __constant__ int3 c_ControlPointImageDim;
+__device__ __constant__ int3 c_tilesDim;
+__device__ __constant__ float3 c_tilesDim_f;
 __device__ __constant__ float3 c_ControlPointVoxelSpacing;
+__device__ __constant__ int3 c_controlPointVoxelSpacingInt;
 __device__ __constant__ float3 c_ControlPointSpacing;
 __device__ __constant__ float3 c_ReferenceSpacing;
 __device__ __constant__ float c_Weight;
 __device__ __constant__ int c_ActiveVoxelNumber;
+__device__ __constant__ float c_xBasis[NUM_C*MAX_CURRENT_SPACE];
+__device__ __constant__ float c_yBasis[NUM_C*MAX_CURRENT_SPACE];
+__device__ __constant__ float c_zBasis[NUM_C*MAX_CURRENT_SPACE];
+__device__ __constant__ float c_x_g0[MAX_CURRENT_SPACE];
+__device__ __constant__ float c_x_h0[MAX_CURRENT_SPACE];
+__device__ __constant__ float c_x_h1[MAX_CURRENT_SPACE];
+__device__ __constant__ float c_y_g0[MAX_CURRENT_SPACE];
+__device__ __constant__ float c_y_h0[MAX_CURRENT_SPACE];
+__device__ __constant__ float c_y_h1[MAX_CURRENT_SPACE];
+__device__ __constant__ float c_z_g0[MAX_CURRENT_SPACE];
+__device__ __constant__ float c_z_h0[MAX_CURRENT_SPACE];
+__device__ __constant__ float c_z_h1[MAX_CURRENT_SPACE];
+__device__ __constant__ float c_x_h0_r[MAX_CURRENT_SPACE];
+__device__ __constant__ float c_x_h1_r[MAX_CURRENT_SPACE];
+__device__ __constant__ float c_y_h0_r[MAX_CURRENT_SPACE];
+__device__ __constant__ float c_y_h1_r[MAX_CURRENT_SPACE];
+__device__ __constant__ float c_z_h0_r[MAX_CURRENT_SPACE];
+__device__ __constant__ float c_z_h1_r[MAX_CURRENT_SPACE];
+__device__ __constant__ float c_x_h01_r[MAX_CURRENT_SPACE*2];
 __device__ __constant__ bool c_Type;
 __device__ __constant__ float3 c_AffineMatrix0;
 __device__ __constant__ float3 c_AffineMatrix1;
@@ -37,6 +59,7 @@ __device__ __constant__ float4 c_AffineMatrix2c;
 /* *************************************************************** */
 /* *************************************************************** */
 texture<float4, 1, cudaReadModeElementType> controlPointTexture;
+texture<float4, cudaTextureType3D, cudaReadModeElementType> controlPoints3Dtex;
 texture<float4, 1, cudaReadModeElementType> secondDerivativesTexture;
 texture<int, 1, cudaReadModeElementType> maskTexture;
 texture<float,1, cudaReadModeElementType> jacobianDeterminantTexture;
@@ -78,6 +101,29 @@ __device__ float4 operator-(float4 a, float4 b){
     return make_float4(a.x-b.x, a.y-b.y, a.z-b.z, 0.f);
 }
 /* *************************************************************** */
+/* *************************************************************** */
+__device__ void GetBasisBSplineValuesShr(float basis, float *values)
+{
+    float FF= basis*basis;
+    float FFF= FF*basis;
+    float MF=1.f-basis;
+    values[Block_reg_bspline_getDeformationField*0] = (MF)*(MF)*(MF)/(6.f);
+    values[Block_reg_bspline_getDeformationField*1] = (3.f*FFF - 6.f*FF + 4.f)/6.f;
+    values[Block_reg_bspline_getDeformationField*2] = (-3.f*FFF + 3.f*FF + 3.f*basis + 1.f)/6.f;
+    values[Block_reg_bspline_getDeformationField*3] = (FFF/6.f);
+}
+/* *************************************************************** */
+/* *************************************************************** */
+__device__ void GetBasisBSplineValuesShrTile(float basis, float *values, unsigned int block_size)
+{
+    float FF= basis*basis;
+    float FFF= FF*basis;
+    float MF=1.f-basis;
+    values[block_size*0] = (MF)*(MF)*(MF)/(6.f);
+    values[block_size*1] = (3.f*FFF - 6.f*FF + 4.f)/6.f;
+    values[block_size*2] = (-3.f*FFF + 3.f*FF + 3.f*basis + 1.f)/6.f;
+    values[block_size*3] = (FFF/6.f);
+}
 /* *************************************************************** */
 __device__ void GetBasisBSplineValues(float basis, float *values)
 {
@@ -298,8 +344,8 @@ __device__ void GetSecondDerivativeBasisValues(int index,
     }
 }
 /* *************************************************************** */
-/* *************************************************************** */
-__global__ void reg_bspline_getDeformationField(float4 *positionField)
+/* ********************* Original NiftyReg ************************* */
+__global__ void reg_bspline_getDeformationField0(float4 *positionField)
 {
     __shared__ float zBasis[Block_reg_bspline_getDeformationField*4];
     __shared__ float yBasis[Block_reg_bspline_getDeformationField*4];
@@ -381,6 +427,1020 @@ __global__ void reg_bspline_getDeformationField(float4 *positionField)
         positionField[tid] = displacement;
     }
     return;
+}
+/* *************************************************************** */
+/* ********************* Original NiftyReg with voxel mask disabled ************************* */
+__global__ void reg_bspline_getDeformationField0_noMask(float4 *positionField)
+{
+    __shared__ float zBasis[Block_reg_bspline_getDeformationField*4];
+    __shared__ float yBasis[Block_reg_bspline_getDeformationField*4];
+
+    const unsigned int tid= (blockIdx.y*gridDim.x+blockIdx.x)*blockDim.x+threadIdx.x;
+    if(tid<c_ActiveVoxelNumber){
+
+        int3 imageSize = c_ReferenceImageDim;
+
+        unsigned int tempIndex=tid;
+        const int z = tempIndex/(imageSize.x*imageSize.y);
+        tempIndex  -= z*imageSize.x*imageSize.y;
+        const int y = tempIndex/imageSize.x;
+        const int x = tempIndex - y*imageSize.x;
+
+        // the "nearest previous" node is determined [0,0,0]
+        int3 nodeAnte;
+        float3 gridVoxelSpacing = c_ControlPointVoxelSpacing;
+        nodeAnte.x = (int)floorf((float)x/gridVoxelSpacing.x);
+        nodeAnte.y = (int)floorf((float)y/gridVoxelSpacing.y);
+        nodeAnte.z = (int)floorf((float)z/gridVoxelSpacing.z);
+
+        const int shareMemIndex = 4*threadIdx.x;
+
+        // Z basis values
+        float relative = fabsf((float)z/gridVoxelSpacing.z-(float)nodeAnte.z);
+        if(c_UseBSpline) GetBasisBSplineValues(relative, &zBasis[shareMemIndex]);
+        else GetBasisSplineValues(relative, &zBasis[shareMemIndex]);
+        // Y basis values
+        relative = fabsf((float)y/gridVoxelSpacing.y-(float)nodeAnte.y);
+        if(c_UseBSpline) GetBasisBSplineValues(relative, &yBasis[shareMemIndex]);
+        else GetBasisSplineValues(relative, &yBasis[shareMemIndex]);
+        // X basis values
+        float xBasis[4];
+        relative = fabsf((float)x/gridVoxelSpacing.x-(float)nodeAnte.x);
+        if(c_UseBSpline) GetBasisBSplineValues(relative, xBasis);
+        else GetBasisSplineValues(relative, xBasis);
+
+        int3 controlPointImageDim = c_ControlPointImageDim;
+        float4 displacement=make_float4(0.0f,0.0f,0.0f,0.0f);
+        float basis;
+        float3 tempDisplacement;
+
+        for(int c=0; c<4; c++){
+            tempDisplacement=make_float3(0.0f,0.0f,0.0f);
+            int indexYZ= ( (nodeAnte.z + c) * controlPointImageDim.y + nodeAnte.y) * controlPointImageDim.x;
+            for(int b=0; b<4; b++){
+
+                int indexXYZ = indexYZ + nodeAnte.x;
+                float4 nodeCoefficientA = tex1Dfetch(controlPointTexture,indexXYZ++);
+                float4 nodeCoefficientB = tex1Dfetch(controlPointTexture,indexXYZ++);
+                float4 nodeCoefficientC = tex1Dfetch(controlPointTexture,indexXYZ++);
+                float4 nodeCoefficientD = tex1Dfetch(controlPointTexture,indexXYZ);
+
+                basis=yBasis[shareMemIndex+b];
+                tempDisplacement.x += (nodeCoefficientA.x * xBasis[0]
+                    + nodeCoefficientB.x * xBasis[1]
+                    + nodeCoefficientC.x * xBasis[2]
+                    + nodeCoefficientD.x * xBasis[3]) * basis;
+
+                tempDisplacement.y += (nodeCoefficientA.y * xBasis[0]
+                    + nodeCoefficientB.y * xBasis[1]
+                    + nodeCoefficientC.y * xBasis[2]
+                    + nodeCoefficientD.y * xBasis[3]) * basis;
+
+                tempDisplacement.z += (nodeCoefficientA.z * xBasis[0]
+                    + nodeCoefficientB.z * xBasis[1]
+                    + nodeCoefficientC.z * xBasis[2]
+                    + nodeCoefficientD.z * xBasis[3]) * basis;
+
+                indexYZ += controlPointImageDim.x;
+            }
+
+            basis =zBasis[shareMemIndex+c];
+            displacement.x += tempDisplacement.x * basis;
+            displacement.y += tempDisplacement.y * basis;
+            displacement.z += tempDisplacement.z * basis;
+        }
+        positionField[tid] = displacement;
+    }
+    return;
+}
+/* *************************************************************** */
+/* ************************** Thread per Tile ******************************** */
+__global__ void reg_bspline_getDeformationFieldTile7_noSh(float4 *positionField, float4 *controlPoint)
+{
+    int3 controlPointImageDim = c_ControlPointImageDim;
+    int3 tilesDim = c_tilesDim;
+
+    int3 nodeAnte;
+    nodeAnte.z = blockIdx.z * blockDim.z + threadIdx.z;
+    nodeAnte.y = blockIdx.y * blockDim.y + threadIdx.y;
+    nodeAnte.x = blockIdx.x * blockDim.x + threadIdx.x;
+
+    //The following line exists in ptx, but not sass. Since it is not known during compilation time it makes the compiler
+    //to change the way it allocates the registers and and in some cases removes possible register spills.
+//    for (int i = 3; i < 4; i+= warpSize) {}
+
+    //put to registers
+    float3 nodeCoefficientA[NUM_C*NUM_C], nodeCoefficientB[NUM_C*NUM_C], nodeCoefficientC[NUM_C*NUM_C], nodeCoefficientD[NUM_C*NUM_C*BLOCK_SIZE];
+    for(int c=0; c<NUM_C; c++){
+        for(int b=0; b<NUM_C; b++){
+            int indexXYZ = ( (nodeAnte.z + c) * controlPointImageDim.y + nodeAnte.y+b) * controlPointImageDim.x + nodeAnte.x;
+
+            float4 temp;
+
+            temp = tex1Dfetch(controlPointTexture,indexXYZ);
+            nodeCoefficientA[b + NUM_C*c] = make_float3(temp.x, temp.y, temp.z);
+            indexXYZ++;
+
+            temp = tex1Dfetch(controlPointTexture,indexXYZ);
+            nodeCoefficientB[b + NUM_C*c] = make_float3(temp.x, temp.y, temp.z);
+            indexXYZ++;
+
+            temp = tex1Dfetch(controlPointTexture,indexXYZ);
+            nodeCoefficientC[b + NUM_C*c] = make_float3(temp.x, temp.y, temp.z);
+            indexXYZ++;;
+
+            temp = tex1Dfetch(controlPointTexture,indexXYZ);
+            nodeCoefficientD[b + NUM_C*c] = make_float3(temp.x, temp.y, temp.z);
+        }
+    }
+
+    if(nodeAnte.x < tilesDim.x && nodeAnte.y < tilesDim.y && nodeAnte.z < tilesDim.z ){
+
+        int3 imageSize = c_ReferenceImageDim;
+
+        int3 gridVoxelSpacing = c_controlPointVoxelSpacingInt;
+
+        for (int k = 0; k < gridVoxelSpacing.z; ++k) {
+            for (int j = 0; j < gridVoxelSpacing.y; ++j) {
+                for (int i = 0; i < gridVoxelSpacing.x; ++i) {
+                    float4 displacement=make_float4(0.0f,0.0f,0.0f,0.0f);
+                    float basis;
+                    float3 tempDisplacement;
+
+                    for(int c=0; c<NUM_C; c++){
+                        tempDisplacement=make_float3(0.0f,0.0f,0.0f);
+                        for(int b=0; b<NUM_C; b++){
+                            basis=c_yBasis[b+NUM_C*j];
+
+                            tempDisplacement.x += nodeCoefficientA[b + NUM_C*c].x * c_xBasis[0+NUM_C*i] * basis;
+                            tempDisplacement.y += nodeCoefficientA[b + NUM_C*c].y * c_xBasis[0+NUM_C*i] * basis;
+                            tempDisplacement.z += nodeCoefficientA[b + NUM_C*c].z * c_xBasis[0+NUM_C*i] * basis;
+
+                            tempDisplacement.x += nodeCoefficientB[b + NUM_C*c].x * c_xBasis[1+NUM_C*i] * basis;
+                            tempDisplacement.y += nodeCoefficientB[b + NUM_C*c].y * c_xBasis[1+NUM_C*i] * basis;
+                            tempDisplacement.z += nodeCoefficientB[b + NUM_C*c].z * c_xBasis[1+NUM_C*i] * basis;
+
+                            tempDisplacement.x += nodeCoefficientC[b + NUM_C*c].x * c_xBasis[2+NUM_C*i] * basis;
+                            tempDisplacement.y += nodeCoefficientC[b + NUM_C*c].y * c_xBasis[2+NUM_C*i] * basis;
+                            tempDisplacement.z += nodeCoefficientC[b + NUM_C*c].z * c_xBasis[2+NUM_C*i] * basis;
+
+                            tempDisplacement.x += nodeCoefficientD[b + NUM_C*c].x * c_xBasis[3+NUM_C*i] * basis;
+                            tempDisplacement.y += nodeCoefficientD[b + NUM_C*c].y * c_xBasis[3+NUM_C*i] * basis;
+                            tempDisplacement.z += nodeCoefficientD[b + NUM_C*c].z * c_xBasis[3+NUM_C*i] * basis;
+                        }
+
+                        basis =c_zBasis[c+NUM_C*k];
+                        displacement.x += tempDisplacement.x * basis;
+                        displacement.y += tempDisplacement.y * basis;
+                        displacement.z += tempDisplacement.z * basis;
+                    }
+
+                    uint3 imgCoord;
+                    imgCoord.z = nodeAnte.z*gridVoxelSpacing.z+k;
+                    imgCoord.y = nodeAnte.y*gridVoxelSpacing.y+j;
+                    imgCoord.x = nodeAnte.x*gridVoxelSpacing.x+i;
+                    unsigned int tmp_index = imgCoord.z*imageSize.x*imageSize.y + imgCoord.y*imageSize.x + imgCoord.x;
+                    if (imgCoord.z < imageSize.z && imgCoord.y < imageSize.y && imgCoord.x < imageSize.x)
+                        positionField[tmp_index] = displacement;
+
+                }
+            }
+        }
+
+    }
+    return;
+}
+/* ******************************* Thread per Tile with Linear Interpolation ******************************** */
+__global__ void reg_bspline_getDeformationFieldTileLerp3_noSh(float4 *positionField, float4 *controlPoint)
+{
+    int3 controlPointImageDim = c_ControlPointImageDim;
+    int3 tilesDim = c_tilesDim;
+
+    int3 nodeAnte;
+    nodeAnte.z = blockIdx.z * blockDim.z + threadIdx.z;
+    nodeAnte.y = blockIdx.y * blockDim.y + threadIdx.y;
+    nodeAnte.x = blockIdx.x * blockDim.x + threadIdx.x;
+
+    const unsigned int tid = threadIdx.z*blockDim.y*blockDim.x + threadIdx.y*blockDim.x+threadIdx.x;
+
+    //The following line exists in ptx, but not sass. Since it is not known during compilation time it makes the compiler
+    //to change the way it allocates the registers and and in some cases removes possible register spills.
+    for (int i = 3; i < 4; i+= warpSize) {}
+
+    //put to registers
+    float3 nodeCoefficientA[NUM_C*NUM_C], nodeCoefficientB[NUM_C*NUM_C], nodeCoefficientC[NUM_C*NUM_C];
+    __shared__ float3 nodeCoefficientD[NUM_C*NUM_C*BLOCK_SIZE];
+    for(int c=0; c<NUM_C; c++){
+        for(int b=0; b<NUM_C; b++){
+            int indexXYZ = ( (nodeAnte.z + c) * controlPointImageDim.y + nodeAnte.y+b) * controlPointImageDim.x + nodeAnte.x;
+
+            float4 temp;
+
+            temp = tex1Dfetch(controlPointTexture,indexXYZ);
+            nodeCoefficientA[b + NUM_C*c] = make_float3(temp.x, temp.y, temp.z);
+            indexXYZ++;
+
+            temp = tex1Dfetch(controlPointTexture,indexXYZ);
+            nodeCoefficientB[b + NUM_C*c] = make_float3(temp.x, temp.y, temp.z);
+            indexXYZ++;
+
+            temp = tex1Dfetch(controlPointTexture,indexXYZ);
+            nodeCoefficientC[b + NUM_C*c] = make_float3(temp.x, temp.y, temp.z);
+            indexXYZ++;
+
+            temp = tex1Dfetch(controlPointTexture,indexXYZ);
+            nodeCoefficientD[(b + NUM_C*c)*BLOCK_SIZE + tid] = make_float3(temp.x, temp.y, temp.z);
+        }
+    }
+
+    if(nodeAnte.x < tilesDim.x && nodeAnte.y < tilesDim.y && nodeAnte.z < tilesDim.z ){
+
+        int3 imageSize = c_ReferenceImageDim;
+
+        int3 gridVoxelSpacing = c_controlPointVoxelSpacingInt;
+
+        for (int k = 0; k < gridVoxelSpacing.z; ++k) {
+            for (int j = 0; j < gridVoxelSpacing.y; ++j) {
+                for (int i = 0; i < gridVoxelSpacing.x; ++i) {
+                    float3 c000_,c001_,c010_,c011_,c100_,c101_,c110_,c111_;
+
+                    c000_ = nodeCoefficientA[0*NUM_C];
+                    c001_ = nodeCoefficientA[0*NUM_C+NUM_C];
+                    c010_ = nodeCoefficientA[0*NUM_C+1];
+                    c011_ = nodeCoefficientA[0*NUM_C+NUM_C+1];
+                    c100_ = nodeCoefficientB[0*NUM_C];
+                    c101_ = nodeCoefficientB[0*NUM_C+NUM_C];
+                    c110_ = nodeCoefficientB[0*NUM_C+1];
+                    c111_ = nodeCoefficientB[0*NUM_C+NUM_C+1];
+
+                    c000_ = c000_ + c_z_h0_r[k]*(c001_-c000_);
+                    c010_ = c010_ + c_z_h0_r[k]*(c011_-c010_);
+                    c100_ = c100_ + c_z_h0_r[k]*(c101_-c100_);
+                    c110_ = c110_ + c_z_h0_r[k]*(c111_-c110_);
+
+                    c000_ = c000_ + c_y_h0_r[j]*(c010_-c000_);
+                    c100_ = c100_ + c_y_h0_r[j]*(c110_-c100_);
+
+                    float3 c000;
+                    c000 =  c000_ + c_x_h0_r[i]*(c100_-c000_);
+
+                    c000_ = nodeCoefficientA[2*NUM_C];
+                    c001_ = nodeCoefficientA[2*NUM_C+NUM_C];
+                    c010_ = nodeCoefficientA[2*NUM_C+1];
+                    c011_ = nodeCoefficientA[2*NUM_C+NUM_C+1];
+                    c100_ = nodeCoefficientB[2*NUM_C];
+                    c101_ = nodeCoefficientB[2*NUM_C+NUM_C];
+                    c110_ = nodeCoefficientB[2*NUM_C+1];
+                    c111_ = nodeCoefficientB[2*NUM_C+NUM_C+1];
+
+                    c000_ = c000_ + c_z_h1_r[k]*(c001_-c000_);
+                    c010_ = c010_ + c_z_h1_r[k]*(c011_-c010_);
+                    c100_ = c100_ + c_z_h1_r[k]*(c101_-c100_);
+                    c110_ = c110_ + c_z_h1_r[k]*(c111_-c110_);
+
+                    c000_ = c000_ + c_y_h0_r[j]*(c010_-c000_);
+                    c100_ = c100_ + c_y_h0_r[j]*(c110_-c100_);
+
+                    float3 c001;
+                    c001 =  c000_ + c_x_h0_r[i]*(c100_-c000_);
+
+                    c000_ = nodeCoefficientA[0*NUM_C+2];
+                    c001_ = nodeCoefficientA[0*NUM_C+NUM_C+2];
+                    c010_ = nodeCoefficientA[0*NUM_C+1+2];
+                    c011_ = nodeCoefficientA[0*NUM_C+NUM_C+1+2];
+                    c100_ = nodeCoefficientB[0*NUM_C+2];
+                    c101_ = nodeCoefficientB[0*NUM_C+NUM_C+2];
+                    c110_ = nodeCoefficientB[0*NUM_C+1+2];
+                    c111_ = nodeCoefficientB[0*NUM_C+NUM_C+1+2];
+
+                    c000_ = c000_ + c_z_h0_r[k]*(c001_-c000_);
+                    c010_ = c010_ + c_z_h0_r[k]*(c011_-c010_);
+                    c100_ = c100_ + c_z_h0_r[k]*(c101_-c100_);
+                    c110_ = c110_ + c_z_h0_r[k]*(c111_-c110_);
+
+                    c000_ = c000_ + c_y_h1_r[j]*(c010_-c000_);
+                    c100_ = c100_ + c_y_h1_r[j]*(c110_-c100_);
+
+                    float3 c010;
+                    c010 =  c000_ + c_x_h0_r[i]*(c100_-c000_);
+
+                    c000_ = nodeCoefficientA[2*NUM_C+2];
+                    c001_ = nodeCoefficientA[2*NUM_C+NUM_C+2];
+                    c010_ = nodeCoefficientA[2*NUM_C+1+2];
+                    c011_ = nodeCoefficientA[2*NUM_C+NUM_C+1+2];
+                    c100_ = nodeCoefficientB[2*NUM_C+2];
+                    c101_ = nodeCoefficientB[2*NUM_C+NUM_C+2];
+                    c110_ = nodeCoefficientB[2*NUM_C+1+2];
+                    c111_ = nodeCoefficientB[2*NUM_C+NUM_C+1+2];
+
+                    c000_ = c000_ + c_z_h1_r[k]*(c001_-c000_);
+                    c010_ = c010_ + c_z_h1_r[k]*(c011_-c010_);
+                    c100_ = c100_ + c_z_h1_r[k]*(c101_-c100_);
+                    c110_ = c110_ + c_z_h1_r[k]*(c111_-c110_);
+
+                    c000_ = c000_ + c_y_h1_r[j]*(c010_-c000_);
+                    c100_ = c100_ + c_y_h1_r[j]*(c110_-c100_);
+
+                    float3 c011;
+                    c011 =  c000_ + c_x_h0_r[i]*(c100_-c000_);
+
+                    c000_ = nodeCoefficientC[0*NUM_C];
+                    c001_ = nodeCoefficientC[0*NUM_C+NUM_C];
+                    c010_ = nodeCoefficientC[0*NUM_C+1];
+                    c011_ = nodeCoefficientC[0*NUM_C+NUM_C+1];
+                    c100_ = nodeCoefficientD[0*NUM_C*BLOCK_SIZE + tid];
+                    c101_ = nodeCoefficientD[(0*NUM_C+NUM_C)*BLOCK_SIZE + tid];
+                    c110_ = nodeCoefficientD[(0*NUM_C+1)*BLOCK_SIZE + tid];
+                    c111_ = nodeCoefficientD[(0*NUM_C+NUM_C+1)*BLOCK_SIZE + tid];
+
+                    c000_ = c000_ + c_z_h0_r[k]*(c001_-c000_);
+                    c010_ = c010_ + c_z_h0_r[k]*(c011_-c010_);
+                    c100_ = c100_ + c_z_h0_r[k]*(c101_-c100_);
+                    c110_ = c110_ + c_z_h0_r[k]*(c111_-c110_);
+
+                    c000_ = c000_ + c_y_h0_r[j]*(c010_-c000_);
+                    c100_ = c100_ + c_y_h0_r[j]*(c110_-c100_);
+
+                    float3 c100;
+                    c100 =  c000_ + c_x_h1_r[i]*(c100_-c000_);
+
+                    c000_ = nodeCoefficientC[2*NUM_C];
+                    c001_ = nodeCoefficientC[2*NUM_C+NUM_C];
+                    c010_ = nodeCoefficientC[2*NUM_C+1];
+                    c011_ = nodeCoefficientC[2*NUM_C+NUM_C+1];
+                    c100_ = nodeCoefficientD[2*NUM_C*BLOCK_SIZE + tid];
+                    c101_ = nodeCoefficientD[(2*NUM_C+NUM_C)*BLOCK_SIZE + tid];
+                    c110_ = nodeCoefficientD[(2*NUM_C+1)*BLOCK_SIZE + tid];
+                    c111_ = nodeCoefficientD[(2*NUM_C+NUM_C+1)*BLOCK_SIZE + tid];
+
+                    c000_ = c000_ + c_z_h1_r[k]*(c001_-c000_);
+                    c010_ = c010_ + c_z_h1_r[k]*(c011_-c010_);
+                    c100_ = c100_ + c_z_h1_r[k]*(c101_-c100_);
+                    c110_ = c110_ + c_z_h1_r[k]*(c111_-c110_);
+
+                    c000_ = c000_ + c_y_h0_r[j]*(c010_-c000_);
+                    c100_ = c100_ + c_y_h0_r[j]*(c110_-c100_);
+
+                    float3 c101;
+                    c101 =  c000_ + c_x_h1_r[i]*(c100_-c000_);
+
+                    c000_ = nodeCoefficientC[0*NUM_C+2];
+                    c001_ = nodeCoefficientC[0*NUM_C+NUM_C+2];
+                    c010_ = nodeCoefficientC[0*NUM_C+1+2];
+                    c011_ = nodeCoefficientC[0*NUM_C+NUM_C+1+2];
+                    c100_ = nodeCoefficientD[(0*NUM_C+2)*BLOCK_SIZE + tid];
+                    c101_ = nodeCoefficientD[(0*NUM_C+NUM_C+2)*BLOCK_SIZE + tid];
+                    c110_ = nodeCoefficientD[(0*NUM_C+1+2)*BLOCK_SIZE + tid];
+                    c111_ = nodeCoefficientD[(0*NUM_C+NUM_C+1+2)*BLOCK_SIZE + tid];
+
+                    c000_ = c000_ + c_z_h0_r[k]*(c001_-c000_);
+                    c010_ = c010_ + c_z_h0_r[k]*(c011_-c010_);
+                    c100_ = c100_ + c_z_h0_r[k]*(c101_-c100_);
+                    c110_ = c110_ + c_z_h0_r[k]*(c111_-c110_);
+
+                    c000_ = c000_ + c_y_h1_r[j]*(c010_-c000_);
+                    c100_ = c100_ + c_y_h1_r[j]*(c110_-c100_);
+
+                    float3 c110;
+                    c110 =  c000_ + c_x_h1_r[i]*(c100_-c000_);
+
+                    c000_ = nodeCoefficientC[2*NUM_C+2];
+                    c001_ = nodeCoefficientC[2*NUM_C+NUM_C+2];
+                    c010_ = nodeCoefficientC[2*NUM_C+1+2];
+                    c011_ = nodeCoefficientC[2*NUM_C+NUM_C+1+2];
+                    c100_ = nodeCoefficientD[(2*NUM_C+2)*BLOCK_SIZE + tid];
+                    c101_ = nodeCoefficientD[(2*NUM_C+NUM_C+2)*BLOCK_SIZE + tid];
+                    c110_ = nodeCoefficientD[(2*NUM_C+1+2)*BLOCK_SIZE + tid];
+                    c111_ = nodeCoefficientD[(2*NUM_C+NUM_C+1+2)*BLOCK_SIZE + tid];
+
+                    c000_ = c000_ + c_z_h1_r[k]*(c001_-c000_);
+                    c010_ = c010_ + c_z_h1_r[k]*(c011_-c010_);
+                    c100_ = c100_ + c_z_h1_r[k]*(c101_-c100_);
+                    c110_ = c110_ + c_z_h1_r[k]*(c111_-c110_);
+
+                    c000_ = c000_ + c_y_h1_r[j]*(c010_-c000_);
+                    c100_ = c100_ + c_y_h1_r[j]*(c110_-c100_);
+
+                    float3 c111;
+                    c111 =  c000_ + c_x_h1_r[i]*(c100_-c000_);
+
+
+                    c000 = c001 + c_z_g0[k]*(c000-c001);
+                    c010 = c011 + c_z_g0[k]*(c010-c011);
+                    c100 = c101 + c_z_g0[k]*(c100-c101);
+                    c110 = c111 + c_z_g0[k]*(c110-c111);
+
+                    c000 = c010 + c_y_g0[j]*(c000-c010);
+                    c100 = c110 + c_y_g0[j]*(c100-c110);
+
+                    c000 = c100 + c_x_g0[i]*(c000-c100);
+
+                    float4 displacement=make_float4(0.0f,0.0f,0.0f,0.0f);
+                    displacement.x = c000.x;
+                    displacement.y = c000.y;
+                    displacement.z = c000.z;
+
+                    uint3 imgCoord;
+                    imgCoord.z = nodeAnte.z*gridVoxelSpacing.z+k;
+                    imgCoord.y = nodeAnte.y*gridVoxelSpacing.y+j;
+                    imgCoord.x = nodeAnte.x*gridVoxelSpacing.x+i;
+                    unsigned int tmp_index = imgCoord.z*imageSize.x*imageSize.y + imgCoord.y*imageSize.x + imgCoord.x;
+                    if (imgCoord.z < imageSize.z && imgCoord.y < imageSize.y && imgCoord.x < imageSize.x)
+                        positionField[tmp_index] = displacement;
+
+                }
+            }
+        }
+
+    }
+    return;
+}
+/* *************************************************************** */
+
+/* ************** Organization into tiles and one Thread per Voxel. 2-way ILP ************** */
+__global__ void reg_bspline_getDeformationFieldTileVoxel6(float4 *positionField, float4 *controlPoint)
+{
+    __shared__ float nodeCoefficientsX[NUM_C*NUM_C*NUM_C];
+    __shared__ float nodeCoefficientsY[NUM_C*NUM_C*NUM_C];
+    __shared__ float nodeCoefficientsZ[NUM_C*NUM_C*NUM_C];
+
+    int3 controlPointImageDim = c_ControlPointImageDim;
+    int3 gridVoxelSpacing = c_controlPointVoxelSpacingInt;
+
+    int3 imageSize = c_ReferenceImageDim;
+
+    // the "nearest previous" node is determined [0,0,0]
+    int3 nodeAnte;
+    nodeAnte.z = blockIdx.z;
+    nodeAnte.y = blockIdx.y;
+    nodeAnte.x = blockIdx.x;
+
+    const uint3 shrMemSz = make_uint3(NUM_C,NUM_C,NUM_C);
+
+    int indexXYZ_init = ( (nodeAnte.z + 0) * controlPointImageDim.y + nodeAnte.y) * controlPointImageDim.x + nodeAnte.x;
+    indexXYZ_init = __shfl_sync(0xffffffff, indexXYZ_init, 0);
+
+    if (threadIdx.x < warpSize) {
+        for (int i = threadIdx.x; i < shrMemSz.x*shrMemSz.y*shrMemSz.z; i+=warpSize) {
+            int indexXYZ = indexXYZ_init
+                    +  (i/(shrMemSz.x*shrMemSz.y)) *controlPointImageDim.x*controlPointImageDim.y
+                    + ((i%(shrMemSz.x*shrMemSz.y))/shrMemSz.x) * controlPointImageDim.x
+                    + ((i%(shrMemSz.x*shrMemSz.y))%shrMemSz.x);
+            float4 temp = tex1Dfetch(controlPointTexture,indexXYZ);
+            nodeCoefficientsX[i] = temp.x;
+            nodeCoefficientsY[i] = temp.y;
+            nodeCoefficientsZ[i] = temp.z;
+        }
+    }
+
+    __syncthreads();
+
+    int k1 = (threadIdx.x / gridVoxelSpacing.x * 2) / gridVoxelSpacing.y;
+    int j1 = (threadIdx.x / gridVoxelSpacing.x * 2) % gridVoxelSpacing.y;
+    int i1 = (threadIdx.x % gridVoxelSpacing.x);
+    int k2 = (threadIdx.x / gridVoxelSpacing.x * 2 + 1) / gridVoxelSpacing.y;
+    int j2 = (threadIdx.x / gridVoxelSpacing.x * 2 + 1) % gridVoxelSpacing.y;
+    int i2 = i1;
+
+    float4 displacement=make_float4(0.0f,0.0f,0.0f,0.0f);
+    float4 displacement2=make_float4(0.0f,0.0f,0.0f,0.0f);
+    float basis, basis2;
+    float3 tempDisplacement, tempDisplacement2;
+
+    for(int c=0; c<NUM_C; c++){
+        tempDisplacement=make_float3(0.0f,0.0f,0.0f);
+        tempDisplacement2=make_float3(0.0f,0.0f,0.0f);
+        int indexYZ = c * shrMemSz.y * shrMemSz.x;
+
+        for(int b=0; b<NUM_C; b++){
+
+            int indexXYZ = indexYZ;
+            float3 nodeCoefficientA, nodeCoefficientB, nodeCoefficientC, nodeCoefficientD;
+
+            nodeCoefficientA = make_float3(nodeCoefficientsX[indexXYZ], nodeCoefficientsY[indexXYZ], nodeCoefficientsZ[indexXYZ]);
+            indexXYZ++;
+
+            nodeCoefficientB = make_float3(nodeCoefficientsX[indexXYZ], nodeCoefficientsY[indexXYZ], nodeCoefficientsZ[indexXYZ]);
+            indexXYZ++;
+
+            nodeCoefficientC = make_float3(nodeCoefficientsX[indexXYZ], nodeCoefficientsY[indexXYZ], nodeCoefficientsZ[indexXYZ]);
+            indexXYZ++;
+
+            nodeCoefficientD = make_float3(nodeCoefficientsX[indexXYZ], nodeCoefficientsY[indexXYZ], nodeCoefficientsZ[indexXYZ]);
+
+            indexYZ += shrMemSz.x;
+
+            basis=c_yBasis[b+NUM_C*j1];
+            basis2=c_yBasis[b+NUM_C*j2];
+
+            tempDisplacement.x += nodeCoefficientA.x * c_xBasis[0+NUM_C*i1] * basis;
+            tempDisplacement.y += nodeCoefficientA.y * c_xBasis[0+NUM_C*i1] * basis;
+            tempDisplacement.z += nodeCoefficientA.z * c_xBasis[0+NUM_C*i1] * basis;
+
+            tempDisplacement.x += nodeCoefficientB.x * c_xBasis[1+NUM_C*i1] * basis;
+            tempDisplacement.y += nodeCoefficientB.y * c_xBasis[1+NUM_C*i1] * basis;
+            tempDisplacement.z += nodeCoefficientB.z * c_xBasis[1+NUM_C*i1] * basis;
+
+            tempDisplacement.x += nodeCoefficientC.x * c_xBasis[2+NUM_C*i1] * basis;
+            tempDisplacement.y += nodeCoefficientC.y * c_xBasis[2+NUM_C*i1] * basis;
+            tempDisplacement.z += nodeCoefficientC.z * c_xBasis[2+NUM_C*i1] * basis;
+
+            tempDisplacement.x += nodeCoefficientD.x * c_xBasis[3+NUM_C*i1] * basis;
+            tempDisplacement.y += nodeCoefficientD.y * c_xBasis[3+NUM_C*i1] * basis;
+            tempDisplacement.z += nodeCoefficientD.z * c_xBasis[3+NUM_C*i1] * basis;
+
+            tempDisplacement2.x += nodeCoefficientA.x * c_xBasis[0+NUM_C*i2] * basis2;
+            tempDisplacement2.y += nodeCoefficientA.y * c_xBasis[0+NUM_C*i2] * basis2;
+            tempDisplacement2.z += nodeCoefficientA.z * c_xBasis[0+NUM_C*i2] * basis2;
+
+            tempDisplacement2.x += nodeCoefficientB.x * c_xBasis[1+NUM_C*i2] * basis2;
+            tempDisplacement2.y += nodeCoefficientB.y * c_xBasis[1+NUM_C*i2] * basis2;
+            tempDisplacement2.z += nodeCoefficientB.z * c_xBasis[1+NUM_C*i2] * basis2;
+
+            tempDisplacement2.x += nodeCoefficientC.x * c_xBasis[2+NUM_C*i2] * basis2;
+            tempDisplacement2.y += nodeCoefficientC.y * c_xBasis[2+NUM_C*i2] * basis2;
+            tempDisplacement2.z += nodeCoefficientC.z * c_xBasis[2+NUM_C*i2] * basis2;
+
+            tempDisplacement2.x += nodeCoefficientD.x * c_xBasis[3+NUM_C*i2] * basis2;
+            tempDisplacement2.y += nodeCoefficientD.y * c_xBasis[3+NUM_C*i2] * basis2;
+            tempDisplacement2.z += nodeCoefficientD.z * c_xBasis[3+NUM_C*i2] * basis2;
+        }
+
+        if (k1 < gridVoxelSpacing.z) basis =c_zBasis[c+NUM_C*k1];
+        if (k2 < gridVoxelSpacing.z) basis2 =c_zBasis[c+NUM_C*k2];
+        displacement.x += tempDisplacement.x * basis;
+        displacement.y += tempDisplacement.y * basis;
+        displacement.z += tempDisplacement.z * basis;
+        displacement2.x += tempDisplacement2.x * basis2;
+        displacement2.y += tempDisplacement2.y * basis2;
+        displacement2.z += tempDisplacement2.z * basis2;
+    }
+
+    uint3 imgCoord;
+    imgCoord.z = nodeAnte.z*gridVoxelSpacing.z+k1;
+    imgCoord.y = nodeAnte.y*gridVoxelSpacing.y+j1;
+    imgCoord.x = nodeAnte.x*gridVoxelSpacing.x+i1;
+    unsigned int tmp_index = imgCoord.z*imageSize.x*imageSize.y + imgCoord.y*imageSize.x + imgCoord.x;
+    if (imgCoord.z < imageSize.z && imgCoord.y < imageSize.y && imgCoord.x < imageSize.x){
+        positionField[tmp_index] = displacement;
+    }
+    if (k2 < gridVoxelSpacing.z) {
+        imgCoord.z = nodeAnte.z*gridVoxelSpacing.z+k2;
+        imgCoord.y = nodeAnte.y*gridVoxelSpacing.y+j2;
+        imgCoord.x = nodeAnte.x*gridVoxelSpacing.x+i2;
+        tmp_index = imgCoord.z*imageSize.x*imageSize.y + imgCoord.y*imageSize.x + imgCoord.x;
+        if (imgCoord.z < imageSize.z && imgCoord.y < imageSize.y && imgCoord.x < imageSize.x){
+            positionField[tmp_index] = displacement2;
+        }
+    }
+
+    return;
+}
+/* *************************************************************** */
+/* ************** Organization into tiles and one Thread per Voxel. 2-way ILP ************** */
+/* Takes care of cases where blocksize < 32 */
+__global__ void reg_bspline_getDeformationFieldTileVoxel6_subWarp(float4 *positionField, float4 *controlPoint)
+{
+    __shared__ float nodeCoefficientsX[NUM_C*NUM_C*NUM_C];
+    __shared__ float nodeCoefficientsY[NUM_C*NUM_C*NUM_C];
+    __shared__ float nodeCoefficientsZ[NUM_C*NUM_C*NUM_C];
+
+    int3 controlPointImageDim = c_ControlPointImageDim;
+    int3 gridVoxelSpacing = c_controlPointVoxelSpacingInt;
+
+    int3 imageSize = c_ReferenceImageDim;
+
+    // the "nearest previous" node is determined [0,0,0]
+    int3 nodeAnte;
+    nodeAnte.z = blockIdx.z;
+    nodeAnte.y = blockIdx.y;
+    nodeAnte.x = blockIdx.x;
+
+    const uint3 shrMemSz = make_uint3(NUM_C,NUM_C,NUM_C);
+
+    int indexXYZ_init = ( (nodeAnte.z + 0) * controlPointImageDim.y + nodeAnte.y) * controlPointImageDim.x + nodeAnte.x;
+    indexXYZ_init = __shfl_sync(0xffffffff, indexXYZ_init, 0);
+
+    for (int i = threadIdx.x; i < shrMemSz.x*shrMemSz.y*shrMemSz.z; i+=blockDim.x) {
+        int indexXYZ = indexXYZ_init
+                +  (i/(shrMemSz.x*shrMemSz.y)) *controlPointImageDim.x*controlPointImageDim.y
+                + ((i%(shrMemSz.x*shrMemSz.y))/shrMemSz.x) * controlPointImageDim.x
+                + ((i%(shrMemSz.x*shrMemSz.y))%shrMemSz.x);
+        float4 temp = tex1Dfetch(controlPointTexture,indexXYZ);
+        nodeCoefficientsX[i] = temp.x;
+        nodeCoefficientsY[i] = temp.y;
+        nodeCoefficientsZ[i] = temp.z;
+    }
+
+    __syncthreads();
+
+    int k1 = (threadIdx.x / gridVoxelSpacing.x * 2) / gridVoxelSpacing.y;
+    int j1 = (threadIdx.x / gridVoxelSpacing.x * 2) % gridVoxelSpacing.y;
+    int i1 = (threadIdx.x % gridVoxelSpacing.x);
+    int k2 = (threadIdx.x / gridVoxelSpacing.x * 2 + 1) / gridVoxelSpacing.y;
+    int j2 = (threadIdx.x / gridVoxelSpacing.x * 2 + 1) % gridVoxelSpacing.y;
+    int i2 = i1;
+
+    float4 displacement=make_float4(0.0f,0.0f,0.0f,0.0f);
+    float4 displacement2=make_float4(0.0f,0.0f,0.0f,0.0f);
+    float basis, basis2;
+    float3 tempDisplacement, tempDisplacement2;
+
+    for(int c=0; c<NUM_C; c++){
+        tempDisplacement=make_float3(0.0f,0.0f,0.0f);
+        tempDisplacement2=make_float3(0.0f,0.0f,0.0f);
+        int indexYZ = c * shrMemSz.y * shrMemSz.x;
+
+        for(int b=0; b<NUM_C; b++){
+
+            int indexXYZ = indexYZ;
+            float3 nodeCoefficientA, nodeCoefficientB, nodeCoefficientC, nodeCoefficientD;
+
+            nodeCoefficientA = make_float3(nodeCoefficientsX[indexXYZ], nodeCoefficientsY[indexXYZ], nodeCoefficientsZ[indexXYZ]);
+            indexXYZ++;
+
+            nodeCoefficientB = make_float3(nodeCoefficientsX[indexXYZ], nodeCoefficientsY[indexXYZ], nodeCoefficientsZ[indexXYZ]);
+            indexXYZ++;
+
+            nodeCoefficientC = make_float3(nodeCoefficientsX[indexXYZ], nodeCoefficientsY[indexXYZ], nodeCoefficientsZ[indexXYZ]);
+            indexXYZ++;
+
+            nodeCoefficientD = make_float3(nodeCoefficientsX[indexXYZ], nodeCoefficientsY[indexXYZ], nodeCoefficientsZ[indexXYZ]);
+
+            indexYZ += shrMemSz.x;
+
+            basis=c_yBasis[b+NUM_C*j1];
+            basis2=c_yBasis[b+NUM_C*j2];
+
+            tempDisplacement.x += nodeCoefficientA.x * c_xBasis[0+NUM_C*i1] * basis;
+            tempDisplacement.y += nodeCoefficientA.y * c_xBasis[0+NUM_C*i1] * basis;
+            tempDisplacement.z += nodeCoefficientA.z * c_xBasis[0+NUM_C*i1] * basis;
+
+            tempDisplacement.x += nodeCoefficientB.x * c_xBasis[1+NUM_C*i1] * basis;
+            tempDisplacement.y += nodeCoefficientB.y * c_xBasis[1+NUM_C*i1] * basis;
+            tempDisplacement.z += nodeCoefficientB.z * c_xBasis[1+NUM_C*i1] * basis;
+
+            tempDisplacement.x += nodeCoefficientC.x * c_xBasis[2+NUM_C*i1] * basis;
+            tempDisplacement.y += nodeCoefficientC.y * c_xBasis[2+NUM_C*i1] * basis;
+            tempDisplacement.z += nodeCoefficientC.z * c_xBasis[2+NUM_C*i1] * basis;
+
+            tempDisplacement.x += nodeCoefficientD.x * c_xBasis[3+NUM_C*i1] * basis;
+            tempDisplacement.y += nodeCoefficientD.y * c_xBasis[3+NUM_C*i1] * basis;
+            tempDisplacement.z += nodeCoefficientD.z * c_xBasis[3+NUM_C*i1] * basis;
+
+            tempDisplacement2.x += nodeCoefficientA.x * c_xBasis[0+NUM_C*i2] * basis2;
+            tempDisplacement2.y += nodeCoefficientA.y * c_xBasis[0+NUM_C*i2] * basis2;
+            tempDisplacement2.z += nodeCoefficientA.z * c_xBasis[0+NUM_C*i2] * basis2;
+
+            tempDisplacement2.x += nodeCoefficientB.x * c_xBasis[1+NUM_C*i2] * basis2;
+            tempDisplacement2.y += nodeCoefficientB.y * c_xBasis[1+NUM_C*i2] * basis2;
+            tempDisplacement2.z += nodeCoefficientB.z * c_xBasis[1+NUM_C*i2] * basis2;
+
+            tempDisplacement2.x += nodeCoefficientC.x * c_xBasis[2+NUM_C*i2] * basis2;
+            tempDisplacement2.y += nodeCoefficientC.y * c_xBasis[2+NUM_C*i2] * basis2;
+            tempDisplacement2.z += nodeCoefficientC.z * c_xBasis[2+NUM_C*i2] * basis2;
+
+            tempDisplacement2.x += nodeCoefficientD.x * c_xBasis[3+NUM_C*i2] * basis2;
+            tempDisplacement2.y += nodeCoefficientD.y * c_xBasis[3+NUM_C*i2] * basis2;
+            tempDisplacement2.z += nodeCoefficientD.z * c_xBasis[3+NUM_C*i2] * basis2;
+        }
+
+        if (k1 < gridVoxelSpacing.z) basis =c_zBasis[c+NUM_C*k1];
+        if (k2 < gridVoxelSpacing.z) basis2 =c_zBasis[c+NUM_C*k2];
+        displacement.x += tempDisplacement.x * basis;
+        displacement.y += tempDisplacement.y * basis;
+        displacement.z += tempDisplacement.z * basis;
+        displacement2.x += tempDisplacement2.x * basis2;
+        displacement2.y += tempDisplacement2.y * basis2;
+        displacement2.z += tempDisplacement2.z * basis2;
+    }
+
+    uint3 imgCoord;
+    imgCoord.z = nodeAnte.z*gridVoxelSpacing.z+k1;
+    imgCoord.y = nodeAnte.y*gridVoxelSpacing.y+j1;
+    imgCoord.x = nodeAnte.x*gridVoxelSpacing.x+i1;
+    unsigned int tmp_index = imgCoord.z*imageSize.x*imageSize.y + imgCoord.y*imageSize.x + imgCoord.x;
+    if (imgCoord.z < imageSize.z && imgCoord.y < imageSize.y && imgCoord.x < imageSize.x){
+        positionField[tmp_index] = displacement;
+    }
+    if (k2 < gridVoxelSpacing.z) {
+        imgCoord.z = nodeAnte.z*gridVoxelSpacing.z+k2;
+        imgCoord.y = nodeAnte.y*gridVoxelSpacing.y+j2;
+        imgCoord.x = nodeAnte.x*gridVoxelSpacing.x+i2;
+        tmp_index = imgCoord.z*imageSize.x*imageSize.y + imgCoord.y*imageSize.x + imgCoord.x;
+        if (imgCoord.z < imageSize.z && imgCoord.y < imageSize.y && imgCoord.x < imageSize.x){
+            positionField[tmp_index] = displacement2;
+        }
+    }
+
+    return;
+}
+/* *************************************************************** */
+/* ************** Organization into tiles and one Thread per Voxel. 4-way ILP ************** */
+__global__ void reg_bspline_getDeformationFieldTileVoxel7(float4 *positionField, float4 *controlPoint)
+{
+    __shared__ float nodeCoefficientsX[NUM_C*NUM_C*NUM_C];
+    __shared__ float nodeCoefficientsY[NUM_C*NUM_C*NUM_C];
+    __shared__ float nodeCoefficientsZ[NUM_C*NUM_C*NUM_C];
+
+    int3 controlPointImageDim = c_ControlPointImageDim;
+    int3 gridVoxelSpacing = c_controlPointVoxelSpacingInt;
+
+    int3 imageSize = c_ReferenceImageDim;
+
+    // the "nearest previous" node is determined [0,0,0]
+    int3 nodeAnte;
+    nodeAnte.z = blockIdx.z;
+    nodeAnte.y = blockIdx.y;
+    nodeAnte.x = blockIdx.x;
+
+    const uint3 shrMemSz = make_uint3(NUM_C,NUM_C,NUM_C);
+
+    int indexXYZ_init = ( (nodeAnte.z + 0) * controlPointImageDim.y + nodeAnte.y) * controlPointImageDim.x + nodeAnte.x;
+    indexXYZ_init = __shfl_sync(0xffffffff, indexXYZ_init, 0);
+
+    if (threadIdx.x < warpSize) {
+        for (int i = threadIdx.x; i < shrMemSz.x*shrMemSz.y*shrMemSz.z; i+=warpSize) {
+            int indexXYZ = indexXYZ_init
+                    +  (i/(shrMemSz.x*shrMemSz.y)) *controlPointImageDim.x*controlPointImageDim.y
+                    + ((i%(shrMemSz.x*shrMemSz.y))/shrMemSz.x) * controlPointImageDim.x
+                    + ((i%(shrMemSz.x*shrMemSz.y))%shrMemSz.x);
+            float4 temp = tex1Dfetch(controlPointTexture,indexXYZ);
+            nodeCoefficientsX[i] = temp.x;
+            nodeCoefficientsY[i] = temp.y;
+            nodeCoefficientsZ[i] = temp.z;
+        }
+    }
+
+    __syncthreads();
+
+    int k1 = (threadIdx.x / gridVoxelSpacing.x * 4) / gridVoxelSpacing.y;
+    int j1 = (threadIdx.x / gridVoxelSpacing.x * 4) % gridVoxelSpacing.y;
+    int i1 = (threadIdx.x % gridVoxelSpacing.x);
+    int k2 = (threadIdx.x / gridVoxelSpacing.x * 4 + 1) / gridVoxelSpacing.y;
+    int j2 = (threadIdx.x / gridVoxelSpacing.x * 4 + 1) % gridVoxelSpacing.y;
+    int i2 = i1;
+    int k3 = (threadIdx.x / gridVoxelSpacing.x * 4 + 2) / gridVoxelSpacing.y;
+    int j3 = (threadIdx.x / gridVoxelSpacing.x * 4 + 2) % gridVoxelSpacing.y;
+    int i3 = i1;
+    int k4 = (threadIdx.x / gridVoxelSpacing.x * 4 + 3) / gridVoxelSpacing.y;
+    int j4 = (threadIdx.x / gridVoxelSpacing.x * 4 + 3) % gridVoxelSpacing.y;
+    int i4 = i1;
+
+    float4 displacement=make_float4(0.0f,0.0f,0.0f,0.0f);
+    float4 displacement2=make_float4(0.0f,0.0f,0.0f,0.0f);
+    float4 displacement3=make_float4(0.0f,0.0f,0.0f,0.0f);
+    float4 displacement4=make_float4(0.0f,0.0f,0.0f,0.0f);
+    float basis, basis2, basis3, basis4;
+    float3 tempDisplacement, tempDisplacement2, tempDisplacement3, tempDisplacement4;
+
+    for(int c=0; c<NUM_C; c++){
+        tempDisplacement=make_float3(0.0f,0.0f,0.0f);
+        tempDisplacement2=make_float3(0.0f,0.0f,0.0f);
+        tempDisplacement3=make_float3(0.0f,0.0f,0.0f);
+        tempDisplacement4=make_float3(0.0f,0.0f,0.0f);
+        int indexYZ = c * shrMemSz.y * shrMemSz.x;
+
+        for(int b=0; b<NUM_C; b++){
+
+            int indexXYZ = indexYZ;
+            float3 nodeCoefficientA, nodeCoefficientB, nodeCoefficientC, nodeCoefficientD;
+
+            nodeCoefficientA = make_float3(nodeCoefficientsX[indexXYZ], nodeCoefficientsY[indexXYZ], nodeCoefficientsZ[indexXYZ]);
+            indexXYZ++;
+
+            nodeCoefficientB = make_float3(nodeCoefficientsX[indexXYZ], nodeCoefficientsY[indexXYZ], nodeCoefficientsZ[indexXYZ]);
+            indexXYZ++;
+
+            nodeCoefficientC = make_float3(nodeCoefficientsX[indexXYZ], nodeCoefficientsY[indexXYZ], nodeCoefficientsZ[indexXYZ]);
+            indexXYZ++;
+
+            nodeCoefficientD = make_float3(nodeCoefficientsX[indexXYZ], nodeCoefficientsY[indexXYZ], nodeCoefficientsZ[indexXYZ]);
+
+            indexYZ += shrMemSz.x;
+
+            basis=c_yBasis[b+NUM_C*j1];
+            basis2=c_yBasis[b+NUM_C*j2];
+            basis3=c_yBasis[b+NUM_C*j3];
+            basis4=c_yBasis[b+NUM_C*j4];
+
+            tempDisplacement.x += nodeCoefficientA.x * c_xBasis[0+NUM_C*i1] * basis;
+            tempDisplacement.y += nodeCoefficientA.y * c_xBasis[0+NUM_C*i1] * basis;
+            tempDisplacement.z += nodeCoefficientA.z * c_xBasis[0+NUM_C*i1] * basis;
+
+            tempDisplacement.x += nodeCoefficientB.x * c_xBasis[1+NUM_C*i1] * basis;
+            tempDisplacement.y += nodeCoefficientB.y * c_xBasis[1+NUM_C*i1] * basis;
+            tempDisplacement.z += nodeCoefficientB.z * c_xBasis[1+NUM_C*i1] * basis;
+
+            tempDisplacement.x += nodeCoefficientC.x * c_xBasis[2+NUM_C*i1] * basis;
+            tempDisplacement.y += nodeCoefficientC.y * c_xBasis[2+NUM_C*i1] * basis;
+            tempDisplacement.z += nodeCoefficientC.z * c_xBasis[2+NUM_C*i1] * basis;
+
+            tempDisplacement.x += nodeCoefficientD.x * c_xBasis[3+NUM_C*i1] * basis;
+            tempDisplacement.y += nodeCoefficientD.y * c_xBasis[3+NUM_C*i1] * basis;
+            tempDisplacement.z += nodeCoefficientD.z * c_xBasis[3+NUM_C*i1] * basis;
+
+            tempDisplacement2.x += nodeCoefficientA.x * c_xBasis[0+NUM_C*i2] * basis2;
+            tempDisplacement2.y += nodeCoefficientA.y * c_xBasis[0+NUM_C*i2] * basis2;
+            tempDisplacement2.z += nodeCoefficientA.z * c_xBasis[0+NUM_C*i2] * basis2;
+
+            tempDisplacement2.x += nodeCoefficientB.x * c_xBasis[1+NUM_C*i2] * basis2;
+            tempDisplacement2.y += nodeCoefficientB.y * c_xBasis[1+NUM_C*i2] * basis2;
+            tempDisplacement2.z += nodeCoefficientB.z * c_xBasis[1+NUM_C*i2] * basis2;
+
+            tempDisplacement2.x += nodeCoefficientC.x * c_xBasis[2+NUM_C*i2] * basis2;
+            tempDisplacement2.y += nodeCoefficientC.y * c_xBasis[2+NUM_C*i2] * basis2;
+            tempDisplacement2.z += nodeCoefficientC.z * c_xBasis[2+NUM_C*i2] * basis2;
+
+            tempDisplacement2.x += nodeCoefficientD.x * c_xBasis[3+NUM_C*i2] * basis2;
+            tempDisplacement2.y += nodeCoefficientD.y * c_xBasis[3+NUM_C*i2] * basis2;
+            tempDisplacement2.z += nodeCoefficientD.z * c_xBasis[3+NUM_C*i2] * basis2;
+
+            tempDisplacement3.x += nodeCoefficientA.x * c_xBasis[0+NUM_C*i3] * basis3;
+            tempDisplacement3.y += nodeCoefficientA.y * c_xBasis[0+NUM_C*i3] * basis3;
+            tempDisplacement3.z += nodeCoefficientA.z * c_xBasis[0+NUM_C*i3] * basis3;
+
+            tempDisplacement3.x += nodeCoefficientB.x * c_xBasis[1+NUM_C*i3] * basis3;
+            tempDisplacement3.y += nodeCoefficientB.y * c_xBasis[1+NUM_C*i3] * basis3;
+            tempDisplacement3.z += nodeCoefficientB.z * c_xBasis[1+NUM_C*i3] * basis3;
+
+            tempDisplacement3.x += nodeCoefficientC.x * c_xBasis[2+NUM_C*i3] * basis3;
+            tempDisplacement3.y += nodeCoefficientC.y * c_xBasis[2+NUM_C*i3] * basis3;
+            tempDisplacement3.z += nodeCoefficientC.z * c_xBasis[2+NUM_C*i3] * basis3;
+
+            tempDisplacement3.x += nodeCoefficientD.x * c_xBasis[3+NUM_C*i3] * basis3;
+            tempDisplacement3.y += nodeCoefficientD.y * c_xBasis[3+NUM_C*i3] * basis3;
+            tempDisplacement3.z += nodeCoefficientD.z * c_xBasis[3+NUM_C*i3] * basis3;
+
+            tempDisplacement4.x += nodeCoefficientA.x * c_xBasis[0+NUM_C*i4] * basis4;
+            tempDisplacement4.y += nodeCoefficientA.y * c_xBasis[0+NUM_C*i4] * basis4;
+            tempDisplacement4.z += nodeCoefficientA.z * c_xBasis[0+NUM_C*i4] * basis4;
+
+            tempDisplacement4.x += nodeCoefficientB.x * c_xBasis[1+NUM_C*i4] * basis4;
+            tempDisplacement4.y += nodeCoefficientB.y * c_xBasis[1+NUM_C*i4] * basis4;
+            tempDisplacement4.z += nodeCoefficientB.z * c_xBasis[1+NUM_C*i4] * basis4;
+
+            tempDisplacement4.x += nodeCoefficientC.x * c_xBasis[2+NUM_C*i4] * basis4;
+            tempDisplacement4.y += nodeCoefficientC.y * c_xBasis[2+NUM_C*i4] * basis4;
+            tempDisplacement4.z += nodeCoefficientC.z * c_xBasis[2+NUM_C*i4] * basis4;
+
+            tempDisplacement4.x += nodeCoefficientD.x * c_xBasis[3+NUM_C*i4] * basis4;
+            tempDisplacement4.y += nodeCoefficientD.y * c_xBasis[3+NUM_C*i4] * basis4;
+            tempDisplacement4.z += nodeCoefficientD.z * c_xBasis[3+NUM_C*i4] * basis4;
+        }
+
+        if (k1 < gridVoxelSpacing.z) basis =c_zBasis[c+NUM_C*k1];
+        if (k2 < gridVoxelSpacing.z) basis2 =c_zBasis[c+NUM_C*k2];
+        if (k3 < gridVoxelSpacing.z) basis3 =c_zBasis[c+NUM_C*k3];
+        if (k4 < gridVoxelSpacing.z) basis4 =c_zBasis[c+NUM_C*k4];
+        displacement.x += tempDisplacement.x * basis;
+        displacement.y += tempDisplacement.y * basis;
+        displacement.z += tempDisplacement.z * basis;
+        displacement2.x += tempDisplacement2.x * basis2;
+        displacement2.y += tempDisplacement2.y * basis2;
+        displacement2.z += tempDisplacement2.z * basis2;
+        displacement3.x += tempDisplacement3.x * basis3;
+        displacement3.y += tempDisplacement3.y * basis3;
+        displacement3.z += tempDisplacement3.z * basis3;
+        displacement4.x += tempDisplacement4.x * basis4;
+        displacement4.y += tempDisplacement4.y * basis4;
+        displacement4.z += tempDisplacement4.z * basis4;
+    }
+
+    uint3 imgCoord;
+    imgCoord.z = nodeAnte.z*gridVoxelSpacing.z+k1;
+    imgCoord.y = nodeAnte.y*gridVoxelSpacing.y+j1;
+    imgCoord.x = nodeAnte.x*gridVoxelSpacing.x+i1;
+    unsigned int tmp_index = imgCoord.z*imageSize.x*imageSize.y + imgCoord.y*imageSize.x + imgCoord.x;
+    if (imgCoord.z < imageSize.z && imgCoord.y < imageSize.y && imgCoord.x < imageSize.x){
+        positionField[tmp_index] = displacement;
+    }
+    if (k2 < gridVoxelSpacing.z) {
+        imgCoord.z = nodeAnte.z*gridVoxelSpacing.z+k2;
+        imgCoord.y = nodeAnte.y*gridVoxelSpacing.y+j2;
+        imgCoord.x = nodeAnte.x*gridVoxelSpacing.x+i2;
+        tmp_index = imgCoord.z*imageSize.x*imageSize.y + imgCoord.y*imageSize.x + imgCoord.x;
+        if (imgCoord.z < imageSize.z && imgCoord.y < imageSize.y && imgCoord.x < imageSize.x){
+            positionField[tmp_index] = displacement2;
+        }
+    }
+    if (k2 < gridVoxelSpacing.z) {
+        imgCoord.z = nodeAnte.z*gridVoxelSpacing.z+k3;
+        imgCoord.y = nodeAnte.y*gridVoxelSpacing.y+j3;
+        imgCoord.x = nodeAnte.x*gridVoxelSpacing.x+i3;
+        tmp_index = imgCoord.z*imageSize.x*imageSize.y + imgCoord.y*imageSize.x + imgCoord.x;
+        if (imgCoord.z < imageSize.z && imgCoord.y < imageSize.y && imgCoord.x < imageSize.x){
+            positionField[tmp_index] = displacement3;
+        }
+    }
+    if (k2 < gridVoxelSpacing.z) {
+        imgCoord.z = nodeAnte.z*gridVoxelSpacing.z+k4;
+        imgCoord.y = nodeAnte.y*gridVoxelSpacing.y+j4;
+        imgCoord.x = nodeAnte.x*gridVoxelSpacing.x+i4;
+        tmp_index = imgCoord.z*imageSize.x*imageSize.y + imgCoord.y*imageSize.x + imgCoord.x;
+        if (imgCoord.z < imageSize.z && imgCoord.y < imageSize.y && imgCoord.x < imageSize.x){
+            positionField[tmp_index] = displacement4;
+        }
+    }
+
+    return;
+}
+/* *************************************************************** */
+
+/* *************************************************************** */
+inline __host__ __device__ float3 operator-(float a, float3 b)
+{
+    return make_float3(a - b.x, a - b.y, a - b.z);
+}
+inline __host__ __device__ float3 operator-(float3 a, float b)
+{
+    return make_float3(a.x - b, a.y - b, a.z - b);
+}
+inline __host__ __device__ float3 floor(const float3 v)
+{
+    return make_float3(floor(v.x), floor(v.y), floor(v.z));
+}
+inline __host__ __device__ float3 operator+(float3 a, float b)
+{
+    return make_float3(a.x + b, a.y + b, a.z + b);
+}
+/* *************************************************************** */
+// Daniels's calculation of the bspline convolution weights
+inline __device__ void bspline_weights(float3 fraction, float3& w0, float3& w1, float3& w2, float3& w3)
+{
+    const float3 one_frac = 1.0f - fraction;
+    const float3 squared = fraction * fraction;
+    const float3 one_sqd = one_frac * one_frac;
+
+    w0 = 1.0f/6.0f * one_sqd * one_frac;
+    w1 = 2.0f/3.0f - 0.5f * squared * (2.0f-fraction);
+    w2 = 2.0f/3.0f - 0.5f * one_sqd * (2.0f-one_frac);
+    w3 = 1.0f/6.0f * squared * fraction;
+}
+/* ********************* Texture Hardware implementation by Ruijters/Sigg ************************* */
+__global__ void reg_bspline_getDeformationFieldDanny(float4 *positionField)
+{
+    float3 volumeExtent = c_tilesDim_f;
+    int3 imageExtent = c_ReferenceImageDim;
+
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    int z = blockIdx.z * blockDim.z + threadIdx.z;
+
+    float u = x / (float)imageExtent.x;
+    float v = y / (float)imageExtent.y;
+    float w = z / (float)imageExtent.z;
+    float3 coord = volumeExtent * make_float3(u, v, w);
+
+    const float3 coord_grid = coord;
+    const float3 index = floor(coord_grid);
+    const float3 fraction = coord_grid - index;
+    float3 w0, w1, w2, w3;
+    bspline_weights(fraction, w0, w1, w2, w3);
+
+    const float3 g0 = w0 + w1;
+    const float3 g1 = w2 + w3;
+    const float3 h0 = (w1 / g0) + 0.5f + index;
+    const float3 h1 = (w3 / g1) + 2.5f + index;
+
+    // fetch the eight linear interpolations
+    float4 tex000 = tex3D(controlPoints3Dtex, h0.x, h0.y, h0.z);
+    float4 tex100 = tex3D(controlPoints3Dtex, h1.x, h0.y, h0.z);
+    tex000 = g0.x * tex000 + g1.x * tex100;  //weigh along the x-direction
+    float4 tex010 = tex3D(controlPoints3Dtex, h0.x, h1.y, h0.z);
+    float4 tex110 = tex3D(controlPoints3Dtex, h1.x, h1.y, h0.z);
+    tex010 = g0.x * tex010 + g1.x * tex110;  //weigh along the x-direction
+    tex000 = g0.y * tex000 + g1.y * tex010;  //weigh along the y-direction
+    float4 tex001 = tex3D(controlPoints3Dtex, h0.x, h0.y, h1.z);
+    float4 tex101 = tex3D(controlPoints3Dtex, h1.x, h0.y, h1.z);
+    tex001 = g0.x * tex001 + g1.x * tex101;  //weigh along the x-direction
+    float4 tex011 = tex3D(controlPoints3Dtex, h0.x, h1.y, h1.z);
+    float4 tex111 = tex3D(controlPoints3Dtex, h1.x, h1.y, h1.z);
+    tex011 = g0.x * tex011 + g1.x * tex111;  //weigh along the x-direction
+    tex001 = g0.y * tex001 + g1.y * tex011;  //weigh along the y-direction
+
+    tex000 = (g0.z * tex000 + g1.z * tex001);  //weigh along the z-direction
+
+    float4 displacement=make_float4(0.0f,0.0f,0.0f,0.0f);
+    displacement.x = tex000.x;
+    displacement.y = tex000.y;
+    displacement.z = tex000.z;
+
+    int tmp_index = z * imageExtent.y * imageExtent.x + y * imageExtent.x + x;
+
+    if (z < imageExtent.z && y < imageExtent.y && x < imageExtent.x)
+        positionField[tmp_index] = displacement;
+
+    return;
+}
+/* *************************************************************** */
+/* *************************************************************** */
+__global__ void warmup(float4 *output)
+{
+    const unsigned int tid = threadIdx.z*blockDim.y*blockDim.x + threadIdx.y*blockDim.x+threadIdx.x;
+
+    float4 value = make_float4(threadIdx.z/threadIdx.x, threadIdx.z*threadIdx.z, 3, threadIdx.y+threadIdx.x);
+    output[tid] = value;
 }
 /* *************************************************************** */
 /* *************************************************************** */

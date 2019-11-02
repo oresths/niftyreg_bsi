@@ -1115,7 +1115,21 @@ void reg_f3d<T>::Initisalise_f3d()
 template <class T>
 void reg_f3d<T>::GetDeformationField()
 {
-    reg_spline_getDeformationField(this->controlPointGrid,
+//    reg_spline_getDeformationField(this->controlPointGrid,
+//                                   this->currentReference,
+//                                   this->deformationFieldImage,
+//                                   this->currentMask,
+//                                   false, //composition
+//                                   true // bspline
+//                                   );
+//    reg_spline_getDeformationField_testing(this->controlPointGrid,
+//                                   this->currentReference,
+//                                   this->deformationFieldImage,
+//                                   this->currentMask,
+//                                   false, //composition
+//                                   true // bspline
+//                                   );
+    reg_spline_getDeformationField_test_reg(this->controlPointGrid,
                                    this->currentReference,
                                    this->deformationFieldImage,
                                    this->currentMask,
